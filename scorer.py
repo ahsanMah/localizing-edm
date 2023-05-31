@@ -69,7 +69,14 @@ class VEScorer(torch.nn.Module):
 
     @torch.inference_mode()
     def forward(
-        self, x, sigma, class_labels=None, force_fp32=False, debug=False, **model_kwargs
+        self,
+        x,
+        sigma,
+        class_labels=None,
+        force_fp32=False,
+        outscale=False,
+        debug=False,
+        **model_kwargs,
     ):
         x = x.to(torch.float32)
         sigma = sigma.to(torch.float32).reshape(-1, 1, 1, 1)
@@ -91,7 +98,9 @@ class VEScorer(torch.nn.Module):
             class_labels=class_labels,
             **model_kwargs,
         )
-        # score = c_out * score.to(torch.float32)
+
+        if outscale:
+            score = c_out * score.to(torch.float32)
 
         if debug:
             print("c_in:", c_skip)
@@ -103,8 +112,7 @@ class VEScorer(torch.nn.Module):
 
 def compute_scores(
     net,
-    dataset_kwargs,
-    data_loader_kwargs,
+    dataset_iterator,
     sigma_min=0.002,
     sigma_max=80,
     num_steps=20,
@@ -131,18 +139,6 @@ def compute_scores(
             sigma_max=sigma_max,
         )
 
-    batch_size = data_loader_kwargs["batch_size"]
-    dataset_obj = dnnlib.util.construct_class_by_name(
-        **dataset_kwargs
-    )  # subclass of training.dataset.Dataset
-
-    dataset_iterator = iter(
-        torch.utils.data.DataLoader(
-            dataset=dataset_obj,
-            **data_loader_kwargs,
-        )
-    )
-
     if model_type == "edm":
         step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
         orig_t_steps = (
@@ -164,18 +160,17 @@ def compute_scores(
         )
         sigma_steps = torch.sqrt(orig_t_steps)
     else:
-        raise ValueError(f"Unknown schedule {schedule}")
-
+        raise ValueError(f"Unknown schedule {model_type}")
 
     scores = []
     for x, _ in tqdm(dataset_iterator, desc="Scoring", leave=False):
-        x = x.to(device)
+        x = x.to(device).to(torch.float32) / 127.5 - 1
         batch_scores = []
 
         for i, t in enumerate(sigma_steps):
-            score = score_fn(x, t, debug=True)
+            score = score_fn(x, t, debug=False)
             score = score.cpu().numpy()
-            print(t, score.mean())
+            # print(t, score.mean())
 
             if return_norms:
                 score = np.linalg.norm(
@@ -183,12 +178,12 @@ def compute_scores(
                     axis=-1,
                 )
             batch_scores.append(score)
-        
+
         batch_scores = np.stack(batch_scores, axis=1)
         scores.append(batch_scores)
 
         break
-    
+
     scores = np.concatenate(scores, axis=0)
 
     return scores
