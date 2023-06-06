@@ -15,6 +15,7 @@ import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 import json
 
+
 class ScoreFlow(torch.nn.Module):
     def __init__(
         self,
@@ -238,7 +239,7 @@ def train_msma_flow(
     num_epochs=100,
     lr=3e-4,
     device=torch.device("cuda"),
-    run_dir ="runs/",
+    run_dir="runs/",
     log_interval=5,
     log_tensorboard=True,
 ):
@@ -246,9 +247,9 @@ def train_msma_flow(
     opt = torch.optim.Adam(flownet.flow.parameters(), lr=lr)
     progbar = tqdm(range(num_epochs))
     num_batches = len(train_ds)
-    
-    checkpoint_path=f"{run_dir}/checkpoint.pth"
-    
+
+    checkpoint_path = f"{run_dir}/checkpoint.pth"
+
     if log_tensorboard:
         writer = SummaryWriter(log_dir=run_dir)
 
@@ -270,18 +271,18 @@ def train_msma_flow(
                 progbar.set_description(f"Loss: {loss.item():.4f}")
 
                 val_loss = 0.0
-                for x in val_ds:
+                for x,_ in val_ds:
                     x = x.to(device).to(torch.float32) / 127.5 - 1
                     z, log_jac_det = flownet(x)
                     val_loss += torch.mean(logloss(z, log_jac_det))
-                    progbar.set_description(f"Val Loss: {loss.item():.4f}")
+                    progbar.set_postfix(val_loss=f"{loss.item():.4f}")
 
                 if log_tensorboard:
                     writer.add_scalar("train_loss", loss.item(), niter)
                     writer.add_scalar("val_loss", val_loss.item(), niter)
 
                 losses.append(loss.item())
-                
+
             niter += 1
             # progbar.set_postfix(batch=f"{niter}/{num_batches}")
 
@@ -306,17 +307,15 @@ def train_msma_flow(
 @click.command()
 @click.option("--num_sigmas", default=10, help="Number of sigmas in the flow.")
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
-
 @click.option("--batch_size", default=128, help="Batch size.")
 @click.option("--lr", default=3e-4, help="Learning rate.")
 @click.option("--fp16", default=False, help="Use fp16.")
-@click.option("--workers", default=4, help="Number of workers.")
-
+@click.option("--workers", default=1, help="Number of workers.")
 @click.option("--device", default="cuda", help="Device to use.")
 @click.option("--run_dir", default="workdir/runs", help="Directory to save runs.")
-
 def main(**kwargs):
-    TRAIN_SAMPLES = 2048
+    TRAIN_SAMPLES = 4000
+    VAL_SAMPLES = 1000
 
     model_root = "/workspace/localizing-edm/workdir/pretrained_models"
     device = torch.device("cuda")
@@ -324,7 +323,7 @@ def main(**kwargs):
     config = dnnlib.EasyDict(kwargs)
 
     opts = dnnlib.EasyDict(
-        data="workdir/datasets/cifar10-32x32.zip",
+        data="workdir/datasets/cifar10/",
         xflip=False,
         augment=0.0,
         cond=False,
@@ -354,18 +353,19 @@ def main(**kwargs):
         dataset_obj.resolution
     )  # be explicit about dataset resolution
     c.dataset_kwargs.max_size = len(dataset_obj)
-    
+    del dataset_obj
+
     # Dump config
     with open(f"{config['run_dir']}/config.json", "w") as f:
-        conf = {"config":config, **c}
+        conf = {"config": config, **c}
         json.dump(conf, f)
 
     # Build dataset
     dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
+    train_ds = Subset(dataset_obj, range(TRAIN_SAMPLES))
 
     # Subset of training dataset
-    train_ds = Subset(dataset_obj, range(TRAIN_SAMPLES))
-    val_ds = Subset(dataset_obj, range(TRAIN_SAMPLES, TRAIN_SAMPLES + 256))
+    val_ds = Subset(dataset_obj, range(TRAIN_SAMPLES, TRAIN_SAMPLES + VAL_SAMPLES))
 
     # Build data loader
     train_ds_loader = torch.utils.data.DataLoader(
@@ -382,12 +382,11 @@ def main(**kwargs):
         conv_inn,
         scorenet=scorenet,
         vectorize=False,
-        use_fp16=True,
+        use_fp16=config["fp16"],
         num_steps=config["num_sigmas"],
         device=device,
     )
 
-    
     # Train
     losses = train_msma_flow(
         flownet,
@@ -395,12 +394,14 @@ def main(**kwargs):
         val_ds_loader,
         num_epochs=config["num_epochs"],
         device=device,
-        run_dir=config['run_dir'],
+        run_dir=config["run_dir"],
+        log_tensorboard=True,
     )
 
-    df = pd.DataFrame(losses, columns=['train_loss'])
-    df['ema'] = df.train_loss.ewm(alpha=0.5).mean()
+    df = pd.DataFrame(losses, columns=["train_loss"])
+    df["ema"] = df.train_loss.ewm(alpha=0.5).mean()
     df.to_csv(f"{config['run_dir']}/losses.csv", index=False)
+
 
 if __name__ == "__main__":
     main()
