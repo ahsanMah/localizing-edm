@@ -14,6 +14,7 @@ import click
 import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 import json
+from torchinfo import summary
 
 
 class ScoreFlow(torch.nn.Module):
@@ -241,7 +242,8 @@ def train_msma_flow(
     device=torch.device("cuda"),
     run_dir="runs/",
     log_interval=5,
-    log_tensorboard=True,
+    checkpoint_interval=100,
+    log_tensorboard=False,
 ):
     losses = []
     opt = torch.optim.Adam(flownet.flow.parameters(), lr=lr)
@@ -281,20 +283,21 @@ def train_msma_flow(
                     writer.add_scalar("train_loss", loss.item(), niter)
                     writer.add_scalar("val_loss", val_loss.item(), niter)
 
-                losses.append(loss.item())
+                losses.append(val_loss.item())
 
             niter += 1
             # progbar.set_postfix(batch=f"{niter}/{num_batches}")
 
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": flownet.state_dict(),
-                "optimizer_state_dict": opt.state_dict(),
-                "val_loss": val_loss.item(),
-            },
-            checkpoint_path,
-        )
+        if niter % checkpoint_interval == 0:
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": flownet.state_dict(),
+                    "optimizer_state_dict": opt.state_dict(),
+                    "val_loss": val_loss.item(),
+                },
+                checkpoint_path,
+            )
 
         progbar.set_description(f"Loss: {loss.item():.4f}")
 
@@ -309,7 +312,7 @@ def train_msma_flow(
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
 @click.option("--batch_size", default=128, help="Batch size.")
 @click.option("--lr", default=3e-4, help="Learning rate.")
-@click.option("--fp16", default=False, help="Use fp16.")
+@click.option("--fp16", default=False, help="Use fp16 (applies to scorenet only).")
 @click.option("--workers", default=1, help="Number of workers.")
 @click.option("--device", default="cuda", help="Device to use.")
 @click.option("--run_dir", default="workdir/runs", help="Directory to save runs.")
@@ -367,6 +370,7 @@ def main(**kwargs):
     # Subset of training dataset
     val_ds = Subset(dataset_obj, range(TRAIN_SAMPLES, TRAIN_SAMPLES + VAL_SAMPLES))
 
+
     # Build data loader
     train_ds_loader = torch.utils.data.DataLoader(
         dataset=train_ds, **c.data_loader_kwargs
@@ -386,6 +390,8 @@ def main(**kwargs):
         num_steps=config["num_sigmas"],
         device=device,
     )
+
+    model_stats = summary(flownet, input_size=(1,*dataset_obj.image_shape), verbose=1)
 
     # Train
     losses = train_msma_flow(
