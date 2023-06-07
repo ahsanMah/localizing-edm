@@ -99,7 +99,7 @@ class Dataset(torch.utils.data.Dataset):
                 self._cached_images[raw_idx] = image
         assert isinstance(image, np.ndarray)
         assert list(image.shape) == self.image_shape
-        assert image.dtype == np.uint8
+        assert image.dtype == np.uint8 or image.dtype == np.float32
         if self._xflip[idx]:
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
@@ -263,53 +263,54 @@ class MVTec(Dataset):
         "mvtec": 128
     }
 
-    def __init__(self, config, device=None, preload=True, **super_kwargs):
+    def __init__(self, config, train=True, device=None, preload=False, **super_kwargs):
         self.cfg = config # MVTec dataset folder path
-        assert self.cfg.mvtec_path is not None, "need to fill in mvtec_path in config.py"
-        self.device = device
         self.category = category =self.cfg.category
-        self.path = os.path.join(self.cfg.mvtec_path, self.category)
-        self.train_pathes = glob(os.path.join(self.path, "train/good/*.png"))
-        self.anomaly_category = os.listdir(os.path.join(self.path, "test"))
-        self.original_image_size = tvio.read_image(self.train_pathes[0]).shape[1]
+        assert self.cfg.mvtec_path is not None, "Need to fill in mvtec_path in config.py"
+        assert category in MVTec.CATEGORY, "Category should be one of {}".format(MVTec.CATEGORY)
+
+        self.device = device
+        self._path = os.path.join(self.cfg.mvtec_path, self.category)
+        self._path = os.path.join(self._path, "train" if train else "test")
+        self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
+        # Sort names for consistency
+        PIL.Image.init()
+        self._image_fnames = sorted(fname for fname in self._all_fnames if ImageFolderDataset._file_ext(fname) in PIL.Image.EXTENSION)
+        self._image_fnames = [os.path.join(self._path, fname) for fname in self._image_fnames]
+        # self._path = os.path.join(self._path, "good/*.png")
+        # self._image_fnames = glob(self._path)
+
+        # self.anomaly_category = os.listdir(os.path.join(self._path, "test"))
+        self.original_image_size = tvio.read_image(self._image_fnames[0]).shape[1]
         self.image_size = self.ImageSize[self.cfg.backbone]
         self.transform = T.Compose([
             T.Resize(self.image_size),
 #             T.Lambda(lambda im: im / 255.0)
         ])
-        if preload:
-            self.preload()
-        super().__init__(name=f"mvtec_{category}", raw_shape=(3,self.image_size,self.image_size), **super_kwargs)
+
+        raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
+        super().__init__(name=f"mvtec_{category}", raw_shape=raw_shape, **super_kwargs)
+        
+        if preload: self.preload()
 
     def load_trans(self, path):
         return self.transform(tvio.read_image(path)).float()
 
     def preload(self):
-        self.train_image = []
-        for p in tqdm(self.train_pathes, desc="Caching samples"):
-            self.train_image.append(self.load_trans(p))
+        self._cache = True
+        for p in tqdm(range(len(self._image_fnames)), desc="Caching samples"):
+            _ = self.__getitem__(p)
+        
         if self.device:
-            for i in range(len(self.train_image)):
-                self.train_image[i] = self.train_image[i].to(self.device)
-        shape = self.train_image[0].shape
-        if shape[0] != 3:
-            self.train_image = [im.expand(3, -1, -1) for im in self.train_image]
-        self.loaded = True
+            for i in range(len(self._cached_images)):
+                self._cached_images[i] = self._cached_images[i].to(self.device)
 
-    def __len__(self):
-        return len(self.train_pathes)
+    def _load_raw_image(self, raw_idx):
+        fname = self._image_fnames[raw_idx]
+        return self.transform(tvio.read_image(fname)).numpy()
 
-    def __getitem__(self, idx):
-        if self.loaded:
-            return self.loaded_read(idx), 0
-        else:
-            return self.read(idx), 0
-
-    def read(self, idx):
-        return self.transform(tvio.read_image(self.pathes[idx])).float()
-
-    def loaded_read(self, idx):
-        return self.train_image[idx]
+    def _load_raw_labels(self):
+        return np.zeros(len(self.pathes))
 
     def load_test(self, skip_normal=False, only_normal=False):
 
