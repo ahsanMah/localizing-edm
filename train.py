@@ -9,6 +9,7 @@
 paper "Elucidating the Design Space of Diffusion-Based Generative Models"."""
 
 import os
+import pickle
 import re
 import json
 import click
@@ -176,6 +177,19 @@ def main(**kwargs):
             raise click.ClickException('--transfer and --resume cannot be specified at the same time')
         c.resume_pkl = opts.transfer
         c.ema_rampup_ratio = None
+
+        # Forcing network params to match the pretrained model.
+        with dnnlib.util.open_url(c.resume_pkl) as f:
+            scorenet = pickle.load(f)["ema"]
+            init_kwargs = scorenet.init_kwargs
+            init_kwargs.pop("img_resolution")
+            init_kwargs.pop("img_channels")
+            if "label_dim" in init_kwargs:
+                init_kwargs.pop("label_dim")
+
+            c.network_kwargs.update(**init_kwargs)
+            del scorenet
+
     elif opts.resume is not None:
         match = re.fullmatch(r'training-state-(\d+).pt', os.path.basename(opts.resume))
         if not match or not os.path.isfile(opts.resume):
