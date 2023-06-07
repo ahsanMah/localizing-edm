@@ -58,6 +58,7 @@ def parse_int_list(s):
 @click.option('--dropout',       help='Dropout probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.13, show_default=True)
 @click.option('--augment',       help='Augment probability', metavar='FLOAT',                       type=click.FloatRange(min=0, max=1), default=0.12, show_default=True)
 @click.option('--xflip',         help='Enable dataset x-flips', metavar='BOOL',                     type=bool, default=False, show_default=True)
+@click.option('--resolution',    help='Resolution for on-the-fly transform', metavar='INT',         type=click.IntRange(min=32), default=None, show_default=True)
 
 # Performance-related.
 @click.option('--fp16',          help='Enable mixed-precision training', metavar='BOOL',            type=bool, default=False, show_default=True)
@@ -94,7 +95,15 @@ def main(**kwargs):
 
     # Initialize config dict.
     c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(class_name='training.dataset.ImageFolderDataset', path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    ds_class = "MVTecDataset" if "mvtec" in opts.data.lower() else "ImageFolderDataset"
+    c.dataset_kwargs = dnnlib.EasyDict(class_name=f"training.dataset.{ds_class}", path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
+    if ds_class == "MVTecDataset":
+        if opts.transfer is not None:
+            model_name = opts.transfer.split("/")[-1].split(".")[0]
+            res = {"baseline-cifar10-32x32-uncond-ve": 32, "edm-imagenet-64x64-cond-adm": 64}[model_name]
+        else:
+            res = opts.resolution
+        c.dataset_kwargs.update(resolution = res)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
     c.loss_kwargs = dnnlib.EasyDict()
