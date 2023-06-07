@@ -252,7 +252,7 @@ class ImageFolderDataset(Dataset):
 
 #----------------------------------------------------------------------------
 ### Adapting from https://github.com/b3r8/mvtec_data_loader/blob/354addfc3075171c01b1aa6b2b7e609d20b0bf67/mvtecDataset.py
-class MVTec(Dataset):
+class MVTecDataset(Dataset):
     CATEGORY = [
         "bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather", "metal_nut", 
         "pill", "screw", "tile", "toothbrush", "transistor", "wood", "zipper"
@@ -263,15 +263,13 @@ class MVTec(Dataset):
         "mvtec": 128
     }
 
-    def __init__(self, config, train=True, device=None, preload=False, **super_kwargs):
-        self.cfg = config # MVTec dataset folder path
-        self.category = category =self.cfg.category
-        assert self.cfg.mvtec_path is not None, "Need to fill in mvtec_path in config.py"
-        assert category in MVTec.CATEGORY, "Category should be one of {}".format(MVTec.CATEGORY)
+    def __init__(self, path, resolution, train=True, preload=False, **super_kwargs):
+        # self.cfg = config # MVTec dataset folder path
+ 
+        self.category = category = path.split("/")[-1]
+        assert category in MVTecDataset.CATEGORY, "Category {category} should be one of {}".format(MVTecDataset.CATEGORY)
 
-        self.device = device
-        self._path = os.path.join(self.cfg.mvtec_path, self.category)
-        self._path = os.path.join(self._path, "train" if train else "test")
+        self._path = os.path.join(path, "train" if train else "test")
         self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
         # Sort names for consistency
         PIL.Image.init()
@@ -282,7 +280,7 @@ class MVTec(Dataset):
 
         # self.anomaly_category = os.listdir(os.path.join(self._path, "test"))
         self.original_image_size = tvio.read_image(self._image_fnames[0]).shape[1]
-        self.image_size = self.ImageSize[self.cfg.backbone]
+        self.image_size = resolution
         self.transform = T.Compose([
             T.Resize(self.image_size),
 #             T.Lambda(lambda im: im / 255.0)
@@ -301,9 +299,9 @@ class MVTec(Dataset):
         for p in tqdm(range(len(self._image_fnames)), desc="Caching samples"):
             _ = self.__getitem__(p)
         
-        if self.device:
-            for i in range(len(self._cached_images)):
-                self._cached_images[i] = self._cached_images[i].to(self.device)
+        # if self.device:
+        #     for i in range(len(self._cached_images)):
+        #         self._cached_images[i] = self._cached_images[i].to(self.device)
 
     def _load_raw_image(self, raw_idx):
         fname = self._image_fnames[raw_idx]
