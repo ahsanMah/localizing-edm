@@ -1,3 +1,4 @@
+import os
 import FrEIA.framework as Ff
 import FrEIA.modules as Fm
 import torch
@@ -18,19 +19,11 @@ from torchinfo import summary
 
 
 class ScoreFlow(torch.nn.Module):
-    def __init__(
-        self,
-        flow,
-        scorenet,
-        num_steps,
-        vectorize=False,
-        use_fp16=False,
-        device=torch.device("cuda"),
-    ):
+    def __init__(self, flow, scorenet, num_steps, vectorize=False, use_fp16=False):
         super().__init__()
-        self.flow = flow.to(device)
+        self.flow = flow
         self.scorenet = VEScorer(
-            scorenet, num_steps=num_steps, use_fp16=use_fp16, device=device
+            scorenet, num_steps=num_steps, use_fp16=use_fp16
         ).requires_grad_(False)
 
         if vectorize:
@@ -46,16 +39,17 @@ class ScoreFlow(torch.nn.Module):
         return self.flow(x_scores.contiguous())
 
 
-def load_pretrained_model(model_root, load_edm=False, device=torch.device("cuda")):
-    if load_edm:
-        model_file = f"{model_root}/edm-cifar10-32x32-uncond-ve.pkl"
-    else:
-        model_file = f"{model_root}/baseline-cifar10-32x32-uncond-ve.pkl"
+def load_pretrained_model(network_pkl):
+    with dnnlib.util.open_url(network_pkl) as f:
+        with torch.no_grad():
+            model = pickle.load(f)
 
-    with dnnlib.util.open_url(model_file) as f:
-        net = pickle.load(f)["ema"].to(device)
-
-    return net
+    config = dnnlib.EasyDict(
+        augment_pipe=dnnlib.EasyDict(**model["augment_pipe"].init_kwargs),
+        dataset_kwargs=dnnlib.EasyDict(**model["dataset_kwargs"]),
+    )
+    net = model["ema"]
+    return net, config
 
 
 def subnet_fc(c_in, c_out, ndim=128):
@@ -260,7 +254,7 @@ def train_msma_flow(
 
     niter = 0
     for epoch in progbar:
-        for x, _ in tqdm(train_ds, total=num_batches):
+        for x, _ in train_ds:
             opt.zero_grad(set_to_none=True)
 
             x = x.to(device).to(torch.float32) / 127.5 - 1
@@ -273,7 +267,7 @@ def train_msma_flow(
                 progbar.set_description(f"Loss: {loss.item():.4f}")
 
                 val_loss = 0.0
-                for x,_ in val_ds:
+                for x, _ in val_ds:
                     x = x.to(device).to(torch.float32) / 127.5 - 1
                     z, log_jac_det = flownet(x)
                     val_loss += torch.mean(logloss(z, log_jac_det))
@@ -304,83 +298,100 @@ def train_msma_flow(
         if log_tensorboard:
             writer.close()
 
+    torch.save(
+        {
+            "epoch": epoch,
+            "model_state_dict": flownet.state_dict(),
+            "optimizer_state_dict": opt.state_dict(),
+            "val_loss": val_loss.item(),
+        },
+        checkpoint_path,
+    )
+
     return losses
 
 
+def build_dataset(dataset_kwargs, val_ratio=0.1):
+    # Build dataset
+    dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
+    train_len = int((1 - val_ratio) * dataset_kwargs.max_size)
+    val_len = dataset_kwargs.max_size - train_len
+    train_ds = Subset(dataset_obj, range(train_len))
+
+    # Subset of training dataset
+    val_ds = Subset(dataset_obj, range(train_len, train_len + val_len))
+
+    return train_ds, val_ds
+
+
 @click.command()
+@click.option(
+    "--network",
+    "network_pkl",
+    help="Network pickle filename",
+    metavar="PATH|URL",
+    type=str,
+    required=True,
+)
+@click.option(
+    "--run_dir",
+    help="Directory to save runs.",
+    metavar="PATH|URL",
+    type=str,
+    required=True,
+)
+# Flow options
 @click.option("--num_sigmas", default=10, help="Number of sigmas in the flow.")
+@click.option(
+    "--num_hres_block", default=4, help="Number of high resolution blocks in the flow."
+)
+@click.option(
+    "--num_lres_block", default=4, help="Number of low resolution blocks in the flow."
+)
+# Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
 @click.option("--batch_size", default=128, help="Batch size.")
 @click.option("--lr", default=3e-4, help="Learning rate.")
 @click.option("--fp16", default=False, help="Use fp16 (applies to scorenet only).")
-@click.option("--workers", default=1, help="Number of workers.")
+@click.option("--workers", default=4, help="Number of workers.")
 @click.option("--device", default="cuda", help="Device to use.")
-@click.option("--run_dir", default="workdir/runs", help="Directory to save runs.")
-def main(**kwargs):
-    TRAIN_SAMPLES = 4000
-    VAL_SAMPLES = 1000
-
-    model_root = "/workspace/localizing-edm/workdir/pretrained_models"
-    device = torch.device("cuda")
+def main(network_pkl, **kwargs):
+    # Load network alongside with its training config.
+    print('Loading network from "%s"' % network_pkl)
+    scorenet, model_config = load_pretrained_model(network_pkl=network_pkl)
+    print("Loaded network")
 
     config = dnnlib.EasyDict(kwargs)
 
-    opts = dnnlib.EasyDict(
-        data="workdir/datasets/cifar10/",
-        xflip=False,
-        augment=0.0,
-        cond=False,
-        cache=True,
-        workers=config["workers"],
-    )
+    # opts = dnnlib.EasyDict(**config.dataset_kwargs)
+    device = torch.device(config.device)
 
-    # Initialize config dict.
-    c = dnnlib.EasyDict()
-    c.dataset_kwargs = dnnlib.EasyDict(
-        class_name="training.dataset.ImageFolderDataset",
-        path=opts.data,
-        use_labels=opts.cond,
-        xflip=opts.xflip,
-        cache=opts.cache,
-    )
-    c.data_loader_kwargs = dnnlib.EasyDict(
-        pin_memory=True,
-        num_workers=opts.workers,
-        prefetch_factor=1,
-        batch_size=config["batch_size"],
-    )
-    # Validate dataset options.
-    dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
-    dataset_name = dataset_obj.name
-    c.dataset_kwargs.resolution = (
-        dataset_obj.resolution
-    )  # be explicit about dataset resolution
-    c.dataset_kwargs.max_size = len(dataset_obj)
-    del dataset_obj
+    c = dnnlib.EasyDict(**model_config)
 
-    # Dump config
-    with open(f"{config['run_dir']}/config.json", "w") as f:
-        conf = {"config": config, **c}
-        json.dump(conf, f)
-
-    # Build dataset
-    dataset_obj = dnnlib.util.construct_class_by_name(**c.dataset_kwargs)
-    train_ds = Subset(dataset_obj, range(TRAIN_SAMPLES))
-
-    # Subset of training dataset
-    val_ds = Subset(dataset_obj, range(TRAIN_SAMPLES, TRAIN_SAMPLES + VAL_SAMPLES))
-
+    # Build datasets
+    train_ds, val_ds = build_dataset(c.dataset_kwargs)
 
     # Build data loader
+    c.data_loader_kwargs = dnnlib.EasyDict(
+        pin_memory=True,
+        num_workers=config.workers,
+        prefetch_factor=2,
+        batch_size=config["batch_size"],
+    )
     train_ds_loader = torch.utils.data.DataLoader(
         dataset=train_ds, **c.data_loader_kwargs
     )
     val_ds_loader = torch.utils.data.DataLoader(dataset=val_ds, **c.data_loader_kwargs)
 
-    # Build models
-    scorenet = load_pretrained_model(model_root=model_root, device=device)
+    # Dump config
+    os.makedirs(config["run_dir"], exist_ok=True)
+    with open(f"{config['run_dir']}/config.json", "w") as f:
+        conf = {"config": config, **c}
+        json.dump(conf, f)
+
+    # Build flow model
     conv_inn = build_model(
-        (config["num_sigmas"], dataset_obj.resolution, dataset_obj.resolution)
+        (config["num_sigmas"], c.dataset_kwargs.resolution, c.dataset_kwargs.resolution)
     )
     flownet = ScoreFlow(
         conv_inn,
@@ -391,7 +402,9 @@ def main(**kwargs):
         device=device,
     )
 
-    model_stats = summary(flownet, input_size=(1,*dataset_obj.image_shape), verbose=1)
+    model_stats = summary(
+        flownet, input_size=(1, *train_ds.dataset.image_shape), verbose=1
+    )
 
     # Train
     losses = train_msma_flow(
