@@ -8,6 +8,7 @@
 """Streaming images and labels from datasets created with dataset_tool.py."""
 
 import os
+import re
 import numpy as np
 import zipfile
 import PIL.Image
@@ -263,12 +264,13 @@ class MVTecDataset(Dataset):
         "mvtec": 128
     }
 
-    def __init__(self, path, resolution, train=True, preload=False, **super_kwargs):
+    def __init__(self, path, resolution, train=True, crop=False, preload=False, **super_kwargs):
         # self.cfg = config # MVTec dataset folder path
  
         self.category = category = path.split("/")[-1]
         assert category in MVTecDataset.CATEGORY, "Category {category} should be one of {}".format(MVTecDataset.CATEGORY)
-
+        self.train_set = train
+        self.root_path = path
         self._path = os.path.join(path, "train" if train else "test")
         self._all_fnames = {os.path.relpath(os.path.join(root, fname), start=self._path) for root, _dirs, files in os.walk(self._path) for fname in files}
         # Sort names for consistency
@@ -307,44 +309,44 @@ class MVTecDataset(Dataset):
         fname = self._image_fnames[raw_idx]
         return self.transform(tvio.read_image(fname)).numpy()
 
-    def _load_raw_labels(self):
-        return np.zeros(len(self.pathes))
-
     def load_test(self, skip_normal=False, only_normal=False):
-
-        if only_normal:
-            image_pathes = glob(os.path.join(self.path, "test/good/*.png"))
-            images, masks = self.load_normal(image_pathes)
-            return images, masks
+        
+        assert self.train_set is False, "Can only load anomalies from test set"
 
         images = [] # [n, 3, H, W]
         masks = [] # [n, 1, H, W]
 
-        for ac in self.anomaly_category:
-            if ac == "good" and skip_normal:
-                continue
-            image_pathes = glob(os.path.join(self.path, "test/{}/*.png".format(ac)))
+        if only_normal or not skip_normal:
+            normal_fnames = list(filter(lambda x: re.search("good", x) , self._image_fnames))
+            normal_images, zero_masks = self.load_normal(normal_fnames)
 
-            if ac == "good":
-                loaded_images, loaded_masks = self.load_normal(image_pathes)
-            else:
-                image_name = [p.split("/")[-1].split(".")[0] for p in image_pathes]
-                mask_pathes = [os.path.join(self.path, "ground_truth", ac, n + "_mask.png") for n in image_name]
-                loaded_images, loaded_masks = self.load_anomaly(image_pathes, mask_pathes)
-            images.extend(loaded_images)
-            masks.extend(loaded_masks)
+            images.extend(normal_images)
+            masks.extend(zero_masks)
+
+        if only_normal:
+            return images, masks
+
+        anomaly_fnames = list(filter(lambda x: re.search("good", x) is None, self._image_fnames))
+        
+        loaded_images, loaded_masks = self.load_anomaly(anomaly_fnames)
+        
+        images.extend(loaded_images)
+        masks.extend(loaded_masks)
+        
         return images, masks
 
-    def load_anomaly(self, image_pathes, mask_pathes):
+    def load_anomaly(self, image_paths):
         images = []
         masks = []
-        for p in image_pathes:
+        for p in image_paths:
             images.append(self.load_trans(p))
-        for p in mask_pathes:
-            masks.append(tvio.read_image(p))
+            mask_path = p.replace("test", "ground_truth").replace(".png", "_mask.png")
+            masks.append(tvio.read_image(mask_path))
+        
         shape = images[0].shape
         if shape[0] != 3:
             images = [im.expand(3, -1, -1) for im in images]
+        
         return images, masks
 
     def load_normal(self, pathes):
