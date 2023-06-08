@@ -2,7 +2,7 @@ import torch
 import numpy as np
 from tqdm import tqdm
 import dnnlib
-
+import matplotlib.pyplot as plt
 
 class EDMScorer(torch.nn.Module):
     def __init__(
@@ -20,7 +20,7 @@ class EDMScorer(torch.nn.Module):
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
-        self.model = model
+        self.model = net.model.eval()
 
         step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
         orig_t_steps = (
@@ -256,3 +256,26 @@ def compute_scores(
     scores = np.concatenate(scores, axis=0)
 
     return scores
+
+
+def plot_score_grid(scores, num_samples = 9, plot_sigma_idxs = [0, 5, 10, 19]):
+    
+    if isinstance(scores, torch.Tensor):
+        scores = scores.cpu().numpy()
+    
+    gridh = gridw = int(num_samples ** 0.5)
+    n = gridh * gridw
+    
+    row = int(np.sqrt(len(plot_sigma_idxs)))
+    col = len(plot_sigma_idxs) // row
+    fig, axs = plt.subplots(row,col, figsize=(gridw*2.5, gridh*2.5), squeeze=False)
+
+    for i, ax in zip(plot_sigma_idxs, axs.flatten()):
+
+        image = np.abs(scores[:n, i])[:,None,...]
+        image = image.reshape(gridh, gridw, *image.shape[1:]).transpose(0, 3, 1, 4, 2)
+        image = image.reshape(gridh * scores.shape[2], gridw * scores.shape[2],)
+        ax.matshow(image)
+        ax.axis("off")
+
+    return
