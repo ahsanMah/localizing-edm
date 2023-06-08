@@ -340,6 +340,7 @@ def build_dataset(dataset_kwargs, val_ratio=0.1):
     type=str,
     required=True,
 )
+@click.option("--resolution", default=None, type=int, help="Resolution of images to train on.")
 # Flow options
 @click.option("--num_sigmas", default=10, help="Number of sigmas in the flow.")
 @click.option(
@@ -367,6 +368,9 @@ def main(network_pkl, **kwargs):
     device = torch.device(config.device)
 
     c = dnnlib.EasyDict(**model_config)
+
+    if config.resolution is not None:
+        c.dataset_kwargs.resolution = int(config.resolution)
 
     # Build datasets
     train_ds, val_ds = build_dataset(c.dataset_kwargs)
@@ -399,7 +403,6 @@ def main(network_pkl, **kwargs):
         vectorize=False,
         use_fp16=config["fp16"],
         num_steps=config["num_sigmas"],
-        device=device,
     )
 
     model_stats = summary(
