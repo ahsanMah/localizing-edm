@@ -99,11 +99,7 @@ def main(**kwargs):
     ds_class = "MVTecDataset" if "mvtec" in opts.data.lower() else "ImageFolderDataset"
     c.dataset_kwargs = dnnlib.EasyDict(class_name=f"training.dataset.{ds_class}", path=opts.data, use_labels=opts.cond, xflip=opts.xflip, cache=opts.cache)
     if ds_class == "MVTecDataset":
-        if opts.transfer is not None:
-            model_name = opts.transfer.split("/")[-1].split(".")[0]
-            res = {"baseline-cifar10-32x32-uncond-ve": 32, "edm-imagenet-64x64-cond-adm": 64}[model_name]
-        else:
-            res = opts.resolution
+        res = opts.resolution
         c.dataset_kwargs.update(resolution = res)
     c.data_loader_kwargs = dnnlib.EasyDict(pin_memory=True, num_workers=opts.workers, prefetch_factor=2)
     c.network_kwargs = dnnlib.EasyDict()
@@ -154,6 +150,12 @@ def main(**kwargs):
         c.augment_kwargs = dnnlib.EasyDict(class_name='training.augment.AugmentPipe', p=opts.augment)
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
         c.network_kwargs.augment_dim = 9
+    
+    # TODO: Have category specific augmentations
+    if "mvtec" in dataset_name:
+        c.augment_kwargs.update(brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
+        c.network_kwargs.augment_dim += 6
+
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
 
     # Training options.
@@ -182,7 +184,7 @@ def main(**kwargs):
         with dnnlib.util.open_url(c.resume_pkl) as f:
             scorenet = pickle.load(f)["ema"]
             init_kwargs = scorenet.init_kwargs
-            init_kwargs.pop("img_resolution")
+            # init_kwargs.pop("img_resolution")
             init_kwargs.pop("img_channels")
             if "label_dim" in init_kwargs:
                 init_kwargs.pop("label_dim")

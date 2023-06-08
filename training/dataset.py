@@ -289,7 +289,7 @@ class MVTecDataset(Dataset):
         ])
 
         raw_shape = [len(self._image_fnames)] + list(self._load_raw_image(0).shape)
-        super().__init__(name=f"mvtec_{category}", raw_shape=raw_shape, **super_kwargs)
+        super().__init__(name=f"mvtec_{category}_{resolution}", raw_shape=raw_shape, **super_kwargs)
         
         if preload: self.preload()
 
