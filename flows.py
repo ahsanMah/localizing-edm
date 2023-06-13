@@ -16,19 +16,32 @@ import pandas as pd
 from torch.utils.tensorboard import SummaryWriter
 import json
 from torchinfo import summary
+from torch.nn.functional import interpolate
 
 
 class ScoreFlow(torch.nn.Module):
-    def __init__(self, flow, scorenet, num_steps, vectorize=False, use_fp16=False):
+    def __init__(
+        self,
+        flow,
+        scorenet,
+        vectorize=False,
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        **scorenet_kwargs,
+    ):
         super().__init__()
-        self.flow = flow
-        self.scorenet = VEScorer(
-            scorenet, num_steps=num_steps, use_fp16=use_fp16
-        ).requires_grad_(False)
+        self.flow = flow.to(device)
+        self.scorenet = VEScorer(scorenet, device=device, **scorenet_kwargs).requires_grad_(False)
 
         if vectorize:
             self.fastscore = self.scorenet.build_vectorized_forward()
             # self.fastscore = torch.jit.script(self.fastscore)
+
+        # Initialize weights with Xavier
+        for m in self.flow.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias.data)
 
     def forward(self, x, vectorize=False, **score_kwargs):
         if vectorize:
@@ -65,7 +78,7 @@ def subnet_fc(c_in, c_out, ndim=128):
 def subnet_conv(c_in, c_out, ndim=256):
     return nn.Sequential(
         nn.Conv2d(c_in, ndim, 3, padding=1),
-        nn.GELU(),
+        nn.ReLU(),
         nn.Conv2d(ndim, c_out, 3, padding=1),
     )
 
@@ -231,12 +244,13 @@ def train_msma_flow(
     flownet,
     train_ds,
     val_ds,
+    augment_pipe=None,
     num_epochs=100,
     lr=3e-4,
     device=torch.device("cuda"),
     run_dir="runs/",
     log_interval=5,
-    checkpoint_interval=100,
+    checkpoint_interval=20,
     log_tensorboard=False,
 ):
     losses = []
@@ -258,20 +272,28 @@ def train_msma_flow(
             opt.zero_grad(set_to_none=True)
 
             x = x.to(device).to(torch.float32) / 127.5 - 1
+            if augment_pipe:
+                x, _ = augment_pipe(x)
             z, log_jac_det = flownet(x)
             loss = torch.mean(logloss(z, log_jac_det))
             loss.backward()
             opt.step()
 
             if niter % log_interval == 0:
-                progbar.set_description(f"Loss: {loss.item():.4f}")
+                flownet.eval()
 
-                val_loss = 0.0
-                for x, _ in val_ds:
-                    x = x.to(device).to(torch.float32) / 127.5 - 1
-                    z, log_jac_det = flownet(x)
-                    val_loss += torch.mean(logloss(z, log_jac_det))
-                    progbar.set_postfix(val_loss=f"{loss.item():.4f}")
+                with torch.no_grad():
+                    val_loss = 0.0
+                    for i, (x, _) in enumerate(val_ds):
+                        x = x.to(device).to(torch.float32) / 127.5 - 1
+                        z, log_jac_det = flownet(x)
+                        val_loss += torch.mean(logloss(z, log_jac_det))
+
+                val_loss /= i + 1
+                progbar.set_description(f"Val Loss: {val_loss.item():.4f}")
+                # progbar.set_postfix(val_loss=f"{loss.item():.4f}")
+
+                flownet.train()
 
                 if log_tensorboard:
                     writer.add_scalar("train_loss", loss.item(), niter)
@@ -280,7 +302,7 @@ def train_msma_flow(
                 losses.append(val_loss.item())
 
             niter += 1
-            # progbar.set_postfix(batch=f"{niter}/{num_batches}")
+            progbar.set_postfix(batch=f"{niter}/{num_batches}")
 
         if niter % checkpoint_interval == 0:
             torch.save(
@@ -295,8 +317,6 @@ def train_msma_flow(
 
         progbar.set_description(f"Loss: {loss.item():.4f}")
 
-        if log_tensorboard:
-            writer.close()
 
     torch.save(
         {
@@ -307,21 +327,36 @@ def train_msma_flow(
         },
         checkpoint_path,
     )
+    if log_tensorboard:
+        writer.close()
 
     return losses
 
 
-def build_dataset(dataset_kwargs, val_ratio=0.1):
+def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
     # Build dataset
+    dataset_kwargs.update(xflip=False)
     dataset_obj = dnnlib.util.construct_class_by_name(**dataset_kwargs)
     train_len = int((1 - val_ratio) * dataset_kwargs.max_size)
     val_len = dataset_kwargs.max_size - train_len
-    train_ds = Subset(dataset_obj, range(train_len))
+
+    augment_kwargs = dnnlib.EasyDict(
+        class_name="training.augment.AugmentPipe", p=augment_prob
+    )
+    augment_kwargs.update(
+        xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
+    )
+    augment_pipe = (
+        dnnlib.util.construct_class_by_name(**augment_kwargs)
+        if augment_prob > 0
+        else None
+    )
 
     # Subset of training dataset
+    train_ds = Subset(dataset_obj, range(train_len))
     val_ds = Subset(dataset_obj, range(train_len, train_len + val_len))
 
-    return train_ds, val_ds
+    return train_ds, val_ds, augment_pipe
 
 
 @click.command()
@@ -340,14 +375,19 @@ def build_dataset(dataset_kwargs, val_ratio=0.1):
     type=str,
     required=True,
 )
-@click.option("--resolution", default=None, type=int, help="Resolution of images to train on.")
-# Flow options
-@click.option("--num_sigmas", default=10, help="Number of sigmas in the flow.")
+# Data options
 @click.option(
-    "--num_hres_block", default=4, help="Number of high resolution blocks in the flow."
+    "--resolution", default=None, type=int, help="Resolution of images to train on."
+)
+@click.option("--augment", default=0.1, help="Probability of augmentation.")
+# Flow options
+@click.option("--sigma_min", default=0.1, help="Minimum sigma for the score norms.")
+@click.option("--num_sigmas", default=10, help="Number of sigmas for the score norms.")
+@click.option(
+    "--hres_blocks", default=4, help="Number of high resolution blocks in the flow."
 )
 @click.option(
-    "--num_lres_block", default=4, help="Number of low resolution blocks in the flow."
+    "--lres_blocks", default=4, help="Number of low resolution blocks in the flow."
 )
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
@@ -373,7 +413,7 @@ def main(network_pkl, **kwargs):
         c.dataset_kwargs.resolution = int(config.resolution)
 
     # Build datasets
-    train_ds, val_ds = build_dataset(c.dataset_kwargs)
+    train_ds, val_ds, augment_pipe = build_dataset(c.dataset_kwargs, config.augment)
 
     # Build data loader
     c.data_loader_kwargs = dnnlib.EasyDict(
@@ -395,14 +435,21 @@ def main(network_pkl, **kwargs):
 
     # Build flow model
     conv_inn = build_model(
-        (config["num_sigmas"], c.dataset_kwargs.resolution, c.dataset_kwargs.resolution)
+        (
+            config["num_sigmas"],
+            c.dataset_kwargs.resolution,
+            c.dataset_kwargs.resolution,
+        ),
+        num_hres_blocks=config["hres_blocks"],
+        num_lres_blocks=config["lres_blocks"],
     )
     flownet = ScoreFlow(
         conv_inn,
         scorenet=scorenet,
         vectorize=False,
         use_fp16=config["fp16"],
-        num_steps=config["num_sigmas"],
+        num_sigmas=config["num_sigmas"],
+        sigma_min=config["sigma_min"],
     )
 
     model_stats = summary(
@@ -414,6 +461,7 @@ def main(network_pkl, **kwargs):
         flownet,
         train_ds_loader,
         val_ds_loader,
+        augment_pipe=augment_pipe,
         num_epochs=config["num_epochs"],
         device=device,
         run_dir=config["run_dir"],

@@ -3,6 +3,28 @@ import numpy as np
 from tqdm import tqdm
 import dnnlib
 import matplotlib.pyplot as plt
+import torch.nn as nn
+
+
+class SpatialNorm2D(nn.Module):
+    def __init__(self, in_channels, kernel_size=3, stride=2, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            groups=in_channels,
+            stride=stride,
+            padding=padding,
+            bias=False,
+        )
+        self.conv.weight.data.fill_(1)  # all ones weights
+        self.conv.weight.requires_grad = False  # freeze weights
+
+    @torch.no_grad()
+    def forward(self, x):
+        return self.conv(x.square()).pow_(0.5)
+
 
 class EDMScorer(torch.nn.Module):
     def __init__(
@@ -69,7 +91,7 @@ class EDMScorer(torch.nn.Module):
 
         batch_scores = torch.stack(batch_scores, axis=1)
 
-        return score
+        return batch_scores
 
 
 class VEScorer(torch.nn.Module):
@@ -77,15 +99,16 @@ class VEScorer(torch.nn.Module):
         self,
         net,
         use_fp16=False,  # Execute the underlying model at FP16 precision?
-        sigma_min=0.02,  # Minimum supported noise level.
+        sigma_min=0.1,  # Minimum supported noise level.
         sigma_max=80,  # Maximum supported noise level.
-        num_steps=20,  # Number of noise levels to evaluate.
-        device=torch.device("cuda"),  # Device to use.
+        num_sigmas=20,  # Number of noise levels to evaluate.
+        device=torch.device("cpu"),  # Device to use.
+        post_downsample=False,  # Downsample the image after scoring.
     ):
         super().__init__()
         self.use_fp16 = use_fp16
         self.model = net.model.eval().to(device)
-        self.num_steps = num_steps
+        self.num_steps = num_sigmas
 
         # Adjust noise levels based on what's supported by the network.
         sigma_min = max(sigma_min, net.sigma_min)
@@ -94,13 +117,17 @@ class VEScorer(torch.nn.Module):
         self.sigma_max = sigma_max
 
         # Compute the noise levels to evaluate.
-        step_indices = torch.arange(num_steps, dtype=torch.float64, device=device)
+        step_indices = torch.arange(self.num_steps, dtype=torch.float64, device=device)
         orig_t_steps = (sigma_max**2) * (
-            (sigma_min**2 / sigma_max**2) ** (step_indices / (num_steps - 1))
+            (sigma_min**2 / sigma_max**2) ** (step_indices / (self.num_steps - 1))
         )
         self.register_buffer(
             "sigma_steps", net.round_sigma(torch.sqrt(orig_t_steps)).to(torch.float64)
         )
+
+        self.downsample = post_downsample
+        if self.downsample:
+            self.norm_pool = SpatialNorm2D(num_sigmas)
 
     @torch.no_grad()
     def forward(
@@ -112,7 +139,7 @@ class VEScorer(torch.nn.Module):
         debug=False,
         **model_kwargs,
     ):
-        x = x.to(torch.float32)
+        # x = x.to(torch.float32)
         class_labels = None
         dtype = (
             torch.float16
@@ -123,8 +150,13 @@ class VEScorer(torch.nn.Module):
         c_skip = 1
         c_in = 1
 
-        batch_scores = []
-        for sigma in self.sigma_steps:
+        batch_scores = torch.zeros(
+            size=(x.shape[0], self.num_steps, *x.shape[2:]),
+            device=x.device, dtype=torch.float32,
+            requires_grad=False,
+        )
+
+        for idx, sigma in enumerate(self.sigma_steps):
             sigma = sigma.reshape(-1, 1, 1, 1)
             c_noise = (0.5 * sigma).log().to(torch.float32)
 
@@ -133,17 +165,21 @@ class VEScorer(torch.nn.Module):
                 c_noise.flatten(),
                 class_labels=class_labels,
                 **model_kwargs,
-            )
+            ).to(torch.float32)
             score = score.mean(dim=1)
+
+            if self.downsample:
+                score = self.norm_pool(score)
             # print(t, score.mean())
-            batch_scores.append(score)
+            batch_scores[:, idx].copy_(score)
+            # batch_scores.append(score)
 
             if debug:
                 print("c_in:", c_skip)
                 print("c_noise:", c_noise)
                 print("c_out:", c_out)
 
-        batch_scores = torch.stack(batch_scores, axis=1).to(torch.float32)
+        # batch_scores = torch.stack(batch_scores, axis=1).to(torch.float32)
 
         if outscale:
             c_out = self.sigma_steps.reshape(1, -1, 1, 1)
@@ -161,12 +197,8 @@ class VEScorer(torch.nn.Module):
         outscale=False,
         debug=False,
         **model_kwargs,
-    ):  
-        dtype = (
-                torch.float16
-                if (self.use_fp16 and not force_fp32)
-                else torch.float32
-        )
+    ):
+        dtype = torch.float16 if (self.use_fp16 and not force_fp32) else torch.float32
 
         if outscale:
             c_out = self.sigma_steps.reshape(1, -1, 1, 1).to(torch.float32)
@@ -258,23 +290,24 @@ def compute_scores(
     return scores
 
 
-def plot_score_grid(scores, num_samples = 9, plot_sigma_idxs = [0, 5, 10, 19]):
-    
+def plot_score_grid(scores, num_samples=9, plot_sigma_idxs=[0, 5, 10, 19]):
     if isinstance(scores, torch.Tensor):
         scores = scores.cpu().numpy()
-    
-    gridh = gridw = int(num_samples ** 0.5)
+
+    gridh = gridw = int(num_samples**0.5)
     n = gridh * gridw
-    
+
     row = int(np.sqrt(len(plot_sigma_idxs)))
     col = len(plot_sigma_idxs) // row
-    fig, axs = plt.subplots(row,col, figsize=(gridw*2.5, gridh*2.5), squeeze=False)
+    fig, axs = plt.subplots(row, col, figsize=(gridw * 2.5, gridh * 2.5), squeeze=False)
 
     for i, ax in zip(plot_sigma_idxs, axs.flatten()):
-
-        image = np.abs(scores[:n, i])[:,None,...]
+        image = np.abs(scores[:n, i])[:, None, ...]
         image = image.reshape(gridh, gridw, *image.shape[1:]).transpose(0, 3, 1, 4, 2)
-        image = image.reshape(gridh * scores.shape[2], gridw * scores.shape[2],)
+        image = image.reshape(
+            gridh * scores.shape[2],
+            gridw * scores.shape[2],
+        )
         ax.matshow(image)
         ax.axis("off")
 
