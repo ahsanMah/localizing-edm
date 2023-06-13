@@ -124,7 +124,7 @@ def main(**kwargs):
         c.network_kwargs.update(channel_mult_noise=1, resample_filter=[1,1], model_channels=128, channel_mult=[2,2,2])
     elif opts.arch == 'ncsnpp':
         c.network_kwargs.update(model_type='SongUNet', embedding_type='fourier', encoder_type='residual', decoder_type='standard')
-        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[2,2,2])
+        c.network_kwargs.update(channel_mult_noise=2, resample_filter=[1,3,3,1], model_channels=128, channel_mult=[1,2,2,2])
     else:
         assert opts.arch == 'adm'
         c.network_kwargs.update(model_type='DhariwalUNet', model_channels=192, channel_mult=[1,2,3,4])
@@ -151,10 +151,10 @@ def main(**kwargs):
         c.augment_kwargs.update(xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1)
         c.network_kwargs.augment_dim = 9
     
-    # TODO: Have category specific augmentations
-    if "mvtec" in dataset_name:
-        c.augment_kwargs.update(brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
-        c.network_kwargs.augment_dim += 6
+        # TODO: Have category specific augmentations
+        if "mvtec" in dataset_name:
+            c.augment_kwargs.update(brightness=1, contrast=1, lumaflip=1, hue=1, saturation=1)
+            c.network_kwargs.augment_dim += 6
 
     c.network_kwargs.update(dropout=opts.dropout, use_fp16=opts.fp16)
 
@@ -179,7 +179,16 @@ def main(**kwargs):
             raise click.ClickException('--transfer and --resume cannot be specified at the same time')
         c.resume_pkl = opts.transfer
         c.ema_rampup_ratio = None
+        
+    elif opts.resume is not None:
+        match = re.fullmatch(r'training-state-(\d+).pt', os.path.basename(opts.resume))
+        if not match or not os.path.isfile(opts.resume):
+            raise click.ClickException('--resume must point to training-state-*.pt from a previous training run')
+        c.resume_pkl = os.path.join(os.path.dirname(opts.resume), f'network-snapshot-{match.group(1)}.pkl')
+        c.resume_kimg = int(match.group(1))
+        c.resume_state_dump = opts.resume
 
+    if opts.transfer is not None or opts.resume is not None:
         # Forcing network params to match the pretrained model.
         with dnnlib.util.open_url(c.resume_pkl) as f:
             scorenet = pickle.load(f)["ema"]
@@ -191,14 +200,6 @@ def main(**kwargs):
 
             c.network_kwargs.update(**init_kwargs)
             del scorenet
-
-    elif opts.resume is not None:
-        match = re.fullmatch(r'training-state-(\d+).pt', os.path.basename(opts.resume))
-        if not match or not os.path.isfile(opts.resume):
-            raise click.ClickException('--resume must point to training-state-*.pt from a previous training run')
-        c.resume_pkl = os.path.join(os.path.dirname(opts.resume), f'network-snapshot-{match.group(1)}.pkl')
-        c.resume_kimg = int(match.group(1))
-        c.resume_state_dump = opts.resume
 
     # Description string.
     cond_str = 'cond' if c.dataset_kwargs.use_labels else 'uncond'
