@@ -25,12 +25,14 @@ class ScoreFlow(torch.nn.Module):
         flow,
         scorenet,
         vectorize=False,
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+        device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
         **scorenet_kwargs,
     ):
         super().__init__()
         self.flow = flow.to(device)
-        self.scorenet = VEScorer(scorenet, device=device, **scorenet_kwargs).requires_grad_(False)
+        self.scorenet = VEScorer(
+            scorenet, device=device, **scorenet_kwargs
+        ).requires_grad_(False)
 
         if vectorize:
             self.fastscore = self.scorenet.build_vectorized_forward()
@@ -51,6 +53,16 @@ class ScoreFlow(torch.nn.Module):
 
         return self.flow(x_scores.contiguous())
 
+    @torch.inference_mode()
+    def log_density(self, x) -> torch.Tensor:
+        z, log_jac_det = self.forward(x)
+        logpz = -0.5 * torch.sum(z**2, dim=1, keepdim=True) + log_jac_det.reshape(
+            z.shape[0], *[1] * len(z.shape[1:])
+        )
+        return logpz
+    
+    def score_anomaly(self, x):
+        return -self.log_density(x)
 
 def load_pretrained_model(network_pkl):
     with dnnlib.util.open_url(network_pkl) as f:
@@ -87,13 +99,11 @@ def subnet_conv_1x1(c_in, c_out, ndim=256):
     return nn.Sequential(nn.Conv2d(c_in, ndim, 1), nn.GELU(), nn.Conv2d(ndim, c_out, 1))
 
 
-def build_model(
-    input_dims, num_filters=256, num_hres_blocks=4, num_lres_blocks=4, num_fc_blocks=0
-):
+def build_model(input_dims, num_filters=256, levels=2, num_blocks=2, num_fc_blocks=0):
     nodes = [Ff.InputNode(*input_dims, name="input")]
 
     # Higher resolution convolutional part
-    for k in range(num_hres_blocks):
+    for k in range(num_blocks):
         nodes.append(
             Ff.Node(
                 nodes[-1],
@@ -108,28 +118,33 @@ def build_model(
             )
         )
 
-    nodes.append(Ff.Node(nodes[-1], Fm.IRevNetDownsampling, {}))
-
     # Lower resolution convolutional part
-    for k in range(num_lres_blocks):
-        if k % 2 == 0:
-            subnet = partial(subnet_conv_1x1, ndim=num_filters)
-        else:
-            subnet = partial(subnet_conv, ndim=num_filters)
+    levels -= 1
+    for i in range(levels):
+        nodes.append(Ff.Node(nodes[-1], Fm.IRevNetDownsampling, {}))
 
-        nodes.append(
-            Ff.Node(
-                nodes[-1],
-                Fm.GLOWCouplingBlock,
-                {"subnet_constructor": subnet, "clamp": 1.2},
-                name=f"conv_low_res_{k}",
+        for k in range(num_blocks):
+            if k % 2 == 0:
+                subnet = partial(subnet_conv_1x1, ndim=num_filters)
+            else:
+                subnet = partial(subnet_conv, ndim=num_filters)
+
+            nodes.append(
+                Ff.Node(
+                    nodes[-1],
+                    Fm.GLOWCouplingBlock,
+                    {"subnet_constructor": subnet, "clamp": 1.2},
+                    name=f"conv_level_{i+1}_res_{k}",
+                )
             )
-        )
-        nodes.append(
-            Ff.Node(
-                nodes[-1], Fm.PermuteRandom, {"seed": k}, name=f"permute_low_res_{k}"
+            nodes.append(
+                Ff.Node(
+                    nodes[-1],
+                    Fm.PermuteRandom,
+                    {"seed": k},
+                    name=f"permute_level_{i+1}_res_{k}",
+                )
             )
-        )
 
     if num_fc_blocks > 0:
         ndim_x = np.prod(input_dims)
@@ -168,7 +183,9 @@ def build_model(
             )
         )
 
-    # nodes.append(Ff.Node(nodes[-1], Fm.IRevNetUpsampling, {}))
+        nodes.append(
+            Ff.Node(nodes[-1], Fm.Reshape, {"output_dims": input_dims}, name="reshape")
+        )
 
     nodes.append(Ff.OutputNode(nodes[-1], name="output"))
     conv_inn = Ff.GraphINN(nodes)
@@ -176,13 +193,13 @@ def build_model(
     return conv_inn
 
 
-@torch.inference_mode()
-def log_density(inn, x) -> torch.Tensor:
-    z, log_jac_det = inn(x)
-    logpz = -0.5 * torch.sum(z**2, dim=1, keepdim=True) - log_jac_det.reshape(
-        z.shape[0], *[1] * len(z.shape[1:])
-    )
-    return logpz
+# @torch.inference_mode()
+# def log_density(inn, x) -> torch.Tensor:
+#     z, log_jac_det = inn(x)
+#     logpz = -0.5 * torch.sum(z**2, dim=1, keepdim=True) - log_jac_det.reshape(
+#         z.shape[0], *[1] * len(z.shape[1:])
+#     )
+#     return logpz
 
 
 @torch.inference_mode()
@@ -191,7 +208,7 @@ def per_dim_ll(inn, x):
     z, log_jac_det = inn(x)
     z = z.cpu().numpy()
     log_jac_det = log_jac_det.cpu().numpy()
-    logpz = -0.5 * z**2 - log_jac_det.reshape(-1, 1)
+    logpz = -0.5 * z**2 + log_jac_det.reshape(-1, 1)
     return logpz
 
 
@@ -200,7 +217,9 @@ def logloss(z, log_jac_det):
     bsz = z.shape[0]
     z = z.reshape(bsz, -1)
     log_jac_det = log_jac_det.reshape(bsz, -1)
-    return 0.5 * torch.mean(z**2, dim=1) - log_jac_det
+    ll = -0.5 * torch.sum(z**2, dim=1) + log_jac_det
+    nll = -torch.mean(ll)
+    return nll
 
 
 def build_nd_flow(input_dim, num_blocks=4, ndim=128):
@@ -225,7 +244,7 @@ def train_flow(
             opt.zero_grad()
             x = x.float().to(device)
             z, log_jac_det = inn(x)
-            loss = torch.mean(logloss(z, log_jac_det))
+            loss = logloss(z, log_jac_det)
             loss.backward()
             opt.step()
 
@@ -317,7 +336,6 @@ def train_msma_flow(
 
         progbar.set_description(f"Loss: {loss.item():.4f}")
 
-
     torch.save(
         {
             "epoch": epoch,
@@ -383,11 +401,9 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
 # Flow options
 @click.option("--sigma_min", default=0.1, help="Minimum sigma for the score norms.")
 @click.option("--num_sigmas", default=10, help="Number of sigmas for the score norms.")
+@click.option("--levels", default=2, type=int, help="Number of blocks for each level.")
 @click.option(
-    "--hres_blocks", default=4, help="Number of high resolution blocks in the flow."
-)
-@click.option(
-    "--lres_blocks", default=4, help="Number of low resolution blocks in the flow."
+    "--num_blocks", default=2, type=int, help="Number of blocks for each level."
 )
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
@@ -440,9 +456,10 @@ def main(network_pkl, **kwargs):
             c.dataset_kwargs.resolution,
             c.dataset_kwargs.resolution,
         ),
-        num_hres_blocks=config["hres_blocks"],
-        num_lres_blocks=config["lres_blocks"],
+        levels=config["levels"],
+        num_blocks=config["num_blocks"],
     )
+
     flownet = ScoreFlow(
         conv_inn,
         scorenet=scorenet,
