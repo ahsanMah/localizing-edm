@@ -150,8 +150,9 @@ class VEScorer(torch.nn.Module):
         c_skip = 1
         c_in = 1
 
+        b,c,h,w = x.shape
         batch_scores = torch.zeros(
-            size=(x.shape[0], self.num_steps, *x.shape[2:]),
+            size=(b, self.num_steps, h, w),
             device=x.device, dtype=torch.float32,
             requires_grad=False,
         )
@@ -168,18 +169,15 @@ class VEScorer(torch.nn.Module):
             ).to(torch.float32)
             score = score.mean(dim=1)
 
-            if self.downsample:
-                score = self.norm_pool(score)
-            # print(t, score.mean())
             batch_scores[:, idx].copy_(score)
-            # batch_scores.append(score)
 
             if debug:
                 print("c_in:", c_skip)
                 print("c_noise:", c_noise)
                 print("c_out:", c_out)
 
-        # batch_scores = torch.stack(batch_scores, axis=1).to(torch.float32)
+        if self.downsample:
+            batch_scores = self.norm_pool(batch_scores)
 
         if outscale:
             c_out = self.sigma_steps.reshape(1, -1, 1, 1)
