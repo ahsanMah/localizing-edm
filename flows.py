@@ -17,7 +17,127 @@ from torch.utils.tensorboard import SummaryWriter
 import json
 from torchinfo import summary
 from torch.nn.functional import interpolate
+import math
 
+# Taken from CFlow-AD repo
+# https://github.com/gudovskiy/cflow-ad/blob/b2ebf9e673a0aa46992a3b18367ec066a57bba89/model.py
+def positionalencoding2d(D, H, W):
+    """
+    :param D: dimension of the model
+    :param H: H of the positions
+    :param W: W of the positions
+    :return: DxHxW position matrix
+    """
+    if D % 4 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(D))
+    P = torch.zeros(D, H, W)
+    # Each dimension use half of D
+    D = D // 2
+    div_term = torch.exp(torch.arange(0.0, D, 2) * -(math.log(1e4) / D))
+    pos_w = torch.arange(0.0, W).unsqueeze(1)
+    pos_h = torch.arange(0.0, H).unsqueeze(1)
+    P[0:D:2, :, :]  = torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[1:D:2, :, :]  = torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
+    P[D::2,  :, :]  = torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    P[D+1::2,:, :]  = torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
+    return P
+
+class PatchFlow(torch.nn.Module):
+    """
+    Contructs a conditional flow model that operates on patches of an image.
+    Each patch is fed into a separate flow model.
+    The flow models are conditioned on a positional encoding of the patch location.
+    The resulting patch-densities can then be recombined into a full image density.
+    """
+    def __init__(self, input_size, patch_size=3, cond_dim=16):
+        
+        super().__init__()
+        
+        channels = input_size[0]
+
+        with torch.no_grad():
+            self.pooler = torch.nn.AvgPool2d(patch_size, stride=2, padding=1).requires_grad_(False)
+            _, c, h, w = self.pooler(torch.empty(1,*input_size)).shape
+            
+            self.spatial_res = (h,w)
+            self.num_patches = h*w
+            self.channels = channels
+            pos = positionalencoding2d(cond_dim, h, w)
+            pos = pos.reshape(cond_dim, self.num_patches)
+            pos = pos.permute(1,0) # N x C_d
+            self.register_buffer("positional_encoding", pos)
+            print(f"Generating {patch_size}x{patch_size} patches from input size: {input_size}")
+            print(f"Pooled spatial resolution: {self.spatial_res}")
+            print(f"Number of flows / patches: {self.num_patches}")
+        
+        # Each patch gets fed into a flow model
+        self.flows = {f"patch_{i}":
+                      self.build_cflow_head(cond_dim, channels) for i in range(self.num_patches)}
+        self.flows = nn.ModuleDict(self.flows)
+        
+        for m in self.flows.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight.data)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias.data)
+    
+    def build_cflow_head(self, n_cond, n_feat):
+        
+        coder = Ff.SequenceINN(n_feat)
+        for k in range(2):
+            coder.append(Fm.AllInOneBlock, cond=0, cond_shape=(n_cond,), subnet_constructor=subnet_fc,
+                global_affine_type='SOFTPLUS', permute_soft=False)
+        
+        return coder
+    
+    def forward(self, x):
+        xs = self.pooler(x)
+        B = xs.shape[0]
+        xs = xs.permute(2, 3, 0, 1) # Patches x batch x channels
+        xs = xs.reshape(self.num_patches, x.shape[0], self.channels)
+
+        zs = []
+        log_jac_dets = []
+        pos = self.positional_encoding.unsqueeze(1).repeat(1,B, 1)
+        for i, (patch_feature, spatial_cond) in enumerate(zip(xs,pos)):
+            f = self.flows[f"patch_{i}"]
+#             print(patch_feature.shape, spatial_cond.shape)
+            z, ldj = f(patch_feature, c=[spatial_cond,])
+            zs.append(z)
+            log_jac_dets.append(ldj)
+#         zs = torch.stack(zs)
+        return zs, log_jac_dets
+    
+    def reverse(self, zs):
+        B = zs[0].shape[0] 
+        pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+        xs = []
+        for i, (patch_feature, spatial_cond) in enumerate(zip(zs,pos)):
+            f = self.flows[f"patch_{i}"]
+#             print(patch_feature.shape, spatial_cond.shape)
+            x, ldj = f(patch_feature, c=[spatial_cond,], rev=True)
+            xs.append(x)
+        return xs
+    
+    
+    def reconstruct(self, zs):
+        '''
+        Reconstructs image from a list of patch densities
+        '''
+        # x is num_patches x batch
+        x = torch.stack(zs)
+        # Swap batch and patch dim
+        x = x.permute(1,0)
+        x = x.reshape(x.shape[0], *self.spatial_res)
+        return x
+    
+    def log_density(self, x):
+        self.eval()
+        with torch.no_grad():
+            zs, jacs = self(x)
+            logpzs = [-0.5*torch.sum(z**2, dim=1) + ldj for z,ldj in zip(zs,jacs)]
+            logpx = self.reconstruct(logpzs)
+        return logpx
 
 class ScoreFlow(torch.nn.Module):
     def __init__(
@@ -46,10 +166,11 @@ class ScoreFlow(torch.nn.Module):
                     nn.init.zeros_(m.bias.data)
 
     def forward(self, x, vectorize=False, **score_kwargs):
-        if vectorize:
-            x_scores = self.fastscore(x)
-        else:
-            x_scores = self.scorenet(x, **score_kwargs)
+        with torch.no_grad():
+            if vectorize:
+                x_scores = self.fastscore(x)
+            else:
+                x_scores = self.scorenet(x, **score_kwargs)
 
         return self.flow(x_scores.contiguous())
 
@@ -60,9 +181,10 @@ class ScoreFlow(torch.nn.Module):
             z.shape[0], *[1] * len(z.shape[1:])
         )
         return logpz
-    
+
     def score_anomaly(self, x):
         return -self.log_density(x)
+
 
 def load_pretrained_model(network_pkl):
     with dnnlib.util.open_url(network_pkl) as f:
@@ -70,9 +192,11 @@ def load_pretrained_model(network_pkl):
             model = pickle.load(f)
 
     config = dnnlib.EasyDict(
-        augment_pipe=dnnlib.EasyDict(**model["augment_pipe"].init_kwargs),
         dataset_kwargs=dnnlib.EasyDict(**model["dataset_kwargs"]),
     )
+    if model["augment_pipe"] is not None:
+        config.augment_pipe = dnnlib.EasyDict(**model["augment_pipe"].init_kwargs)
+
     net = model["ema"]
     return net, config
 
@@ -90,7 +214,7 @@ def subnet_fc(c_in, c_out, ndim=128):
 def subnet_conv(c_in, c_out, ndim=256):
     return nn.Sequential(
         nn.Conv2d(c_in, ndim, 3, padding=1),
-        nn.ReLU(),
+        nn.SiLU(),
         nn.Conv2d(ndim, c_out, 3, padding=1),
     )
 
@@ -98,8 +222,8 @@ def subnet_conv(c_in, c_out, ndim=256):
 def subnet_conv_1x1(c_in, c_out, ndim=256):
     return nn.Sequential(nn.Conv2d(c_in, ndim, 1), nn.GELU(), nn.Conv2d(ndim, c_out, 1))
 
-
-def build_model(input_dims, num_filters=256, levels=2, num_blocks=2, num_fc_blocks=0):
+#TODO: Make a U-Net style model
+def build_model(input_dims, num_filters=256, levels=2, num_blocks=2, num_fc_blocks=0, unet=False):
     nodes = [Ff.InputNode(*input_dims, name="input")]
 
     # Higher resolution convolutional part
@@ -145,6 +269,19 @@ def build_model(input_dims, num_filters=256, levels=2, num_blocks=2, num_fc_bloc
                     name=f"permute_level_{i+1}_res_{k}",
                 )
             )
+
+    if unet:
+        # Upsampling part
+        for i in range(levels):
+            nodes.append(Ff.Node(nodes[-1], Fm.HaarUpsampling, {}))
+
+            nodes.append(Ff.Node(nodes[-1],
+                                Fm.AllInOneBlock,
+                                {'subnet_constructor':subnet_conv},
+                                name=F'conv_high_res_{k}'))
+            nodes.append(Ff.Node(nodes[-1],
+                                Fm.AllInOneBlock,
+                                {'subnet_constructor':subnet_conv, 'gin_block':True}))
 
     if num_fc_blocks > 0:
         ndim_x = np.prod(input_dims)
@@ -306,7 +443,7 @@ def train_msma_flow(
                     for i, (x, _) in enumerate(val_ds):
                         x = x.to(device).to(torch.float32) / 127.5 - 1
                         z, log_jac_det = flownet(x)
-                        val_loss += torch.mean(logloss(z, log_jac_det))
+                        val_loss += logloss(z, log_jac_det)
 
                 val_loss /= i + 1
                 progbar.set_description(f"Val Loss: {val_loss.item():.4f}")
@@ -405,6 +542,7 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
 @click.option(
     "--num_blocks", default=2, type=int, help="Number of blocks for each level."
 )
+@click.option("--unet", default=False, help="Use U-Net-like architecture (for the lower levels only).")
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
 @click.option("--batch_size", default=128, help="Batch size.")
