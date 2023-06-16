@@ -18,6 +18,7 @@ import json
 from torchinfo import summary
 from torch.nn.functional import interpolate
 import math
+from torch_utils import misc
 
 
 def subnet_fc(c_in, c_out, ndim=256):
@@ -180,7 +181,7 @@ class PatchFlow(torch.nn.Module):
         B = zs[0].shape[0]
         pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
         xs = []
-        
+
         for i, (patch_feature, spatial_cond) in enumerate(zip(zs, pos)):
             x, ldj = self.flow(
                 patch_feature,
@@ -196,13 +197,13 @@ class PatchFlow(torch.nn.Module):
         """
         Reconstructs image from a list of patch densities
         """
-        hres_logpx = zs.pop(0)[:,None,None]
+        hres_logpx = zs.pop(0)[:, None, None]
         # x is num_patches x batch
         x = torch.stack(zs)
         # Swap batch and patch dim
         x = x.permute(1, 0)
         x = x.reshape(x.shape[0], *self.spatial_res)
-        return x #+ hres_logpx
+        return x  # + hres_logpx
 
     def log_density(self, x):
         self.eval()
@@ -309,7 +310,7 @@ def build_conv_model(
             Ff.Node(nodes[-1], Fm.IRevNetDownsampling, {}, name=f"downsample_{i}")
         )
 
-        for k in range(num_blocks*2):
+        for k in range(num_blocks * 2):
             if k % 2 == 0:
                 subnet = partial(subnet_conv_1x1, ndim=num_filters)
             else:
@@ -509,7 +510,7 @@ def train_msma_flow(
     train_ds,
     val_ds,
     augment_pipe=None,
-    num_epochs=100,
+    kimg=10,
     lr=3e-4,
     device=torch.device("cuda"),
     run_dir="runs/",
@@ -520,8 +521,9 @@ def train_msma_flow(
 ):
     losses = []
     opt = torch.optim.Adam(flownet.flow.parameters(), lr=lr)
-    progbar = tqdm(range(num_epochs))
-    num_batches = len(train_ds)
+    batch_sz = train_ds.batch_size
+    total_iters = kimg*1000//batch_sz + 1
+    progbar = tqdm(range(total_iters))
     train_step = patchflow_step if patchflow else fastflow_step
     checkpoint_path = f"{run_dir}/checkpoint.pth"
 
@@ -532,63 +534,63 @@ def train_msma_flow(
     flownet.train()
 
     niter = 0
-    for epoch in progbar:
-        for x, _ in train_ds:
-            # opt.zero_grad(set_to_none=True)
+    imgcount = 0
+    train_iter = iter(train_ds)
+    val_iter = iter(val_ds)
 
-            x = x.to(device).to(torch.float32) / 127.5 - 1
-            if augment_pipe:
-                x, _ = augment_pipe(x)
+    for niter in progbar:
+        x, _ = next(train_iter)
+        x = x.to(device).to(torch.float32) / 127.5 - 1
+        if augment_pipe:
+            x, _ = augment_pipe(x)
 
-            loss = train_step(flownet, x, opt)
+        loss = train_step(flownet, x, opt)
 
+        if log_tensorboard:
+            writer.add_scalar("train_loss", loss, niter)
+
+        if niter % log_interval == 0:
+            flownet.eval()
+
+            with torch.no_grad():
+                val_loss = 0.0
+                x, _ = next(val_iter)
+                x = x.to(device).to(torch.float32) / 127.5 - 1
+                z, log_jac_det = flownet(x)
+                if patchflow:
+                    for z, ldj in zip(z, log_jac_det):
+                        val_loss += nll(z, ldj).item()
+                else:
+                    val_loss += logloss(z, log_jac_det).item()
+
+            flownet.train()
+
+            progbar.set_description(f"Val Loss: {val_loss:.4f}")
             if log_tensorboard:
-                writer.add_scalar("train_loss", loss, niter)
-            
-            if niter % log_interval == 0:
-                flownet.eval()
+                writer.add_scalar("val_loss", val_loss, niter)
+            losses.append(val_loss)
 
-                with torch.no_grad():
-                    val_loss = 0.0
-                    for i, (x, _) in enumerate(val_ds):
-                        x = x.to(device).to(torch.float32) / 127.5 - 1
-                        z, log_jac_det = flownet(x)
-                        if patchflow:
-                            for z, ldj in zip(z, log_jac_det):
-                                val_loss += nll(z, ldj).item()
-                        else:
-                            val_loss += logloss(z, log_jac_det).item()
+        imgcount += x.shape[0]
+        progbar.set_postfix(batch=f"{imgcount}/{kimg}K")
 
-                val_loss /= i + 1
-                progbar.set_description(f"Val Loss: {val_loss:.4f}")
-                # progbar.set_postfix(val_loss=f"{loss.item():.4f}")
-
-                flownet.train()
-
-                if log_tensorboard:
-                    writer.add_scalar("val_loss", val_loss, niter)
-
-                losses.append(val_loss)
-
-            niter += 1
-            progbar.set_postfix(batch=f"{niter}/{num_batches}")
-
-        if niter % checkpoint_interval == 0:
-            torch.save(
-                {
-                    "epoch": epoch,
-                    "model_state_dict": flownet.state_dict(),
-                    "optimizer_state_dict": opt.state_dict(),
-                    "val_loss": val_loss,
-                },
-                checkpoint_path,
-            )
+    if niter % checkpoint_interval == 0:
+        torch.save(
+            {
+                "epoch": -1,
+                "kimg": niter,
+                "model_state_dict": flownet.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "val_loss": val_loss,
+            },
+            checkpoint_path,
+        )
 
         # progbar.set_description(f"Loss: {loss:.4f}")
 
     torch.save(
-        {
-            "epoch": epoch,
+        {   
+            "epoch": -1,
+            "kimg": niter,
             "model_state_dict": flownet.state_dict(),
             "optimizer_state_dict": opt.state_dict(),
             "val_loss": val_loss,
@@ -612,8 +614,9 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
         class_name="training.augment.AugmentPipe", p=augment_prob
     )
     augment_kwargs.update(
-        xflip=1e8, yflip=1, scale=1, rotate_frac=1, aniso=1, translate_frac=1
+        xflip=1e8, yflip=0, scale=1, rotate_frac=1, aniso=1, translate_frac=1
     )
+
     augment_pipe = (
         dnnlib.util.construct_class_by_name(**augment_kwargs)
         if augment_prob > 0
@@ -662,11 +665,13 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
 )
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
+@click.option("--kimg", default=10, help="Number of images to train for in 1000s.")
 @click.option("--batch_size", default=128, help="Batch size.")
 @click.option("--lr", default=3e-4, help="Learning rate.")
 @click.option("--fp16", default=False, help="Use fp16 (applies to scorenet only).")
 @click.option("--workers", default=4, help="Number of workers.")
 @click.option("--device", default="cuda", help="Device to use.")
+@click.option("--seed", default=42, type=int, help="Device to use.")
 def main(network_pkl, **kwargs):
     # Load network alongside with its training config.
     print('Loading network from "%s"' % network_pkl)
@@ -674,11 +679,8 @@ def main(network_pkl, **kwargs):
     print("Loaded network")
 
     config = dnnlib.EasyDict(kwargs)
-
-    # opts = dnnlib.EasyDict(**config.dataset_kwargs)
-    device = torch.device(config.device)
-
     c = dnnlib.EasyDict(**model_config)
+    device = torch.device(config.device)
 
     if config.resolution is not None:
         c.dataset_kwargs.resolution = int(config.resolution)
@@ -693,10 +695,17 @@ def main(network_pkl, **kwargs):
         prefetch_factor=2,
         batch_size=config["batch_size"],
     )
+
     train_ds_loader = torch.utils.data.DataLoader(
-        dataset=train_ds, **c.data_loader_kwargs
+        dataset=train_ds,
+        sampler=misc.InfiniteSampler(dataset=train_ds, seed=config.seed),
+        **c.data_loader_kwargs,
     )
-    val_ds_loader = torch.utils.data.DataLoader(dataset=val_ds, **c.data_loader_kwargs)
+    val_ds_loader = torch.utils.data.DataLoader(
+        dataset=val_ds,
+        sampler=misc.InfiniteSampler(dataset=val_ds, seed=config.seed),
+        **c.data_loader_kwargs,
+    )
 
     # Dump config
     os.makedirs(config["run_dir"], exist_ok=True)
@@ -737,7 +746,7 @@ def main(network_pkl, **kwargs):
     )
 
     model_stats = summary(
-        flownet, input_size=(1, *train_ds.dataset.image_shape), verbose=1
+        flownet, input_size=(1, *train_ds.dataset.image_shape), verbose=1, depth=1,
     )
 
     # Train
@@ -746,7 +755,8 @@ def main(network_pkl, **kwargs):
         train_ds_loader,
         val_ds_loader,
         augment_pipe=augment_pipe,
-        num_epochs=config["num_epochs"],
+        # num_epochs=config["num_epochs"],
+        kimg=config["kimg"],
         device=device,
         run_dir=config["run_dir"],
         log_tensorboard=True,
