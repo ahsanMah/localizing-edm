@@ -21,7 +21,11 @@ import math
 from torch_utils import misc
 
 
-def subnet_fc(c_in, c_out, ndim=256):
+_GCONST_ = -0.9189385332046727 # ln(sqrt(2*pi))
+def logprob(z, ldj):
+    return _GCONST_ - 0.5 * torch.sum(z**2, dim=1) + ldj
+
+def subnet_fc(c_in, c_out, ndim=128):
     return nn.Sequential(
         nn.Linear(c_in, ndim),
         nn.GELU(),
@@ -122,8 +126,10 @@ class PatchFlow(torch.nn.Module):
         # 2x downsampling -> 4x channels
         global_cond_dim = channels * 4
 
-        cond_dims = spatial_cond_dim + global_cond_dim
-        self.flow = self.build_cflow_head(cond_dims, channels, num_blocks)
+        cond_dims = spatial_cond_dim  # + global_cond_dim
+        self.flow = self.build_cflow_head(
+            cond_dims, channels + global_cond_dim, num_blocks
+        )
 
         # for m in self.modules():
         #     print(m)
@@ -169,13 +175,46 @@ class PatchFlow(torch.nn.Module):
         ):
             # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
             z, ldj = self.flow(
-                patch_feature,
-                c=[torch.cat([glb_ctx, spatial_cond], dim=-1)],
+                # patch_feature,
+                # c=[torch.cat([glb_ctx, spatial_cond], dim=-1)],
+                torch.cat([patch_feature, glb_ctx], dim=-1),
+                c=[spatial_cond],
             )
             zs.append(z)
             log_jac_dets.append(ldj)
 
         return zs, log_jac_dets
+
+    def stochastic_train_step(self, x, n_patches=1):
+        B = x.shape[0]
+
+        hres_zs, hres_log_jac_dets = self.highres_flow(x)
+        global_context_patches = self.patchify(hres_zs)
+        xs = self.pooler(x)
+        local_patches = self.patchify(xs)  # Patches x batch x channels
+        # local_patches = self.patchify(hres_zs)
+
+        zs = []
+        log_jac_dets = []
+        pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+
+        rand_idx = torch.randperm(self.num_patches)[:n_patches]
+        for idx in rand_idx:
+            patch_feature, glb_ctx, spatial_cond = (
+                local_patches[idx],
+                global_context_patches[idx],
+                pos[idx],
+            )
+            z, ldj = self.flow(
+                # patch_feature,
+                # c=[torch.cat([glb_ctx, spatial_cond], dim=-1)],
+                torch.cat([patch_feature, glb_ctx], dim=-1),
+                c=[spatial_cond],
+            )
+            zs.append(z)
+            log_jac_dets.append(ldj)
+
+        return zs, log_jac_dets, hres_log_jac_dets
 
     def reverse(self, zs):
         B = zs[0].shape[0]
@@ -212,6 +251,41 @@ class PatchFlow(torch.nn.Module):
             logpzs = [-0.5 * torch.sum(z**2, dim=1) + ldj for z, ldj in zip(zs, jacs)]
             logpx = self.reconstruct(logpzs)
         return logpx
+
+
+def patchflow_stochastic_step(flownet, x, opt, n_samples=128):
+    n_samples = min(n_samples, flownet.flow.num_patches)
+    scores = flownet.scorenet(x)
+    # Optimizing the highres flow
+    # Note this could be combined with the patch loss below
+    # But dual optimizer step is more stable
+    opt.zero_grad(set_to_none=True)
+    hres_zs, hres_log_jac_dets = flownet.flow.highres_flow(scores)
+    hres_loss = nll(hres_zs.reshape(x.shape[0], -1), hres_log_jac_dets)
+    hres_loss = hres_loss / n_samples
+    hres_loss.backward()
+    opt.step()
+
+    total_loss = hres_loss.item()
+    # Optimizing the patch flow
+    zs, log_jac_dets, _ = flownet.flow.stochastic_train_step(
+        scores, n_patches=n_samples
+    )
+    patch_losses = [nll(z, ldj) for z, ldj in zip(zs, log_jac_dets)]
+    loss = 0.0
+    opt.zero_grad(set_to_none=True)
+    for l in patch_losses:
+        loss = loss + l
+    loss.backward()
+    opt.step()
+
+    total_loss += loss.item()
+
+    return {
+        "loss": total_loss,
+        "global_loss": hres_loss.item(),
+        "local_loss": loss.item(),
+    }
 
 
 class ScoreFlow(torch.nn.Module):
@@ -292,16 +366,18 @@ def build_conv_model(
         nodes.append(
             Ff.Node(
                 nodes[-1],
-                Fm.GLOWCouplingBlock,
-                {"subnet_constructor": subnet_conv, "clamp": 1.2},
+                Fm.AllInOneBlock,
+                {"subnet_constructor": subnet_conv},
                 name=f"conv_high_res_{k}",
             )
         )
-        nodes.append(
-            Ff.Node(
-                nodes[-1], Fm.PermuteRandom, {"seed": k}, name=f"permute_high_res_{k}"
-            )
-        )
+        # nodes.append(
+        #     Ff.Node(
+        #         nodes[-1],
+        #         Fm.AllInOneBlock,
+        #         {"subnet_constructor": subnet_conv, "gin_block": False},
+        #     )
+        # )
 
     # Lower resolution convolutional part
     levels -= 1
@@ -310,7 +386,7 @@ def build_conv_model(
             Ff.Node(nodes[-1], Fm.IRevNetDownsampling, {}, name=f"downsample_{i}")
         )
 
-        for k in range(num_blocks * 2):
+        for k in range(num_blocks):
             if k % 2 == 0:
                 subnet = partial(subnet_conv_1x1, ndim=num_filters)
             else:
@@ -319,17 +395,17 @@ def build_conv_model(
             nodes.append(
                 Ff.Node(
                     nodes[-1],
-                    Fm.GLOWCouplingBlock,
-                    {"subnet_constructor": subnet, "clamp": 1.2},
-                    name=f"conv_level_{i+1}_res_{k}",
+                    Fm.AllInOneBlock,
+                    {"subnet_constructor": subnet_conv},
+                    name=f"conv_high_res_{k}",
                 )
             )
+
             nodes.append(
                 Ff.Node(
                     nodes[-1],
-                    Fm.PermuteRandom,
-                    {"seed": k},
-                    name=f"permute_level_{i+1}_res_{k}",
+                    Fm.AllInOneBlock,
+                    {"subnet_constructor": subnet_conv_1x1},
                 )
             )
 
@@ -425,15 +501,14 @@ def logloss(z, log_jac_det):
     bsz = z.shape[0]
     z = z.reshape(bsz, -1)
     log_jac_det = log_jac_det.reshape(bsz, -1)
-    ll = -0.5 * torch.sum(z**2, dim=1) + log_jac_det
+    ll = logprob(z, log_jac_det)
     nll = -torch.mean(ll)
     return nll
 
 
 def nll(z, ldj):
-    logpz = -0.5 * torch.sum(z**2, dim=1)
-    logpz += ldj
-    return -torch.mean(logpz)
+    # logpz = -0.5 * torch.sum(z**2, dim=1) + ldj
+    return -torch.mean(logprob(z, ldj))
 
 
 def build_nd_flow(input_dim, num_blocks=4, ndim=128):
@@ -474,7 +549,9 @@ def train_flow(
 
 
 def patchflow_step(flownet, x, opt):
+    # scores = flownet.scorenet(x)
     zs, log_jac_dets = flownet(x)
+
     total_loss = 0.0
     # for z, ljd in zip(zs, log_jac_dets):
     #     opt.zero_grad(set_to_none=True)
@@ -502,7 +579,7 @@ def fastflow_step(flownet, x, opt):
     loss = logloss(z, log_jac_det)
     loss.backward()
     opt.step()
-    return loss.item()
+    return {"loss": loss.item()}
 
 
 def train_msma_flow(
@@ -522,9 +599,9 @@ def train_msma_flow(
     losses = []
     opt = torch.optim.Adam(flownet.flow.parameters(), lr=lr)
     batch_sz = train_ds.batch_size
-    total_iters = kimg*1000//batch_sz + 1
+    total_iters = kimg * 1000 // batch_sz + 1
     progbar = tqdm(range(total_iters))
-    train_step = patchflow_step if patchflow else fastflow_step
+    train_step = patchflow_stochastic_step if patchflow else fastflow_step
     checkpoint_path = f"{run_dir}/checkpoint.pth"
 
     if log_tensorboard:
@@ -544,10 +621,11 @@ def train_msma_flow(
         if augment_pipe:
             x, _ = augment_pipe(x)
 
-        loss = train_step(flownet, x, opt)
+        loss_dict = train_step(flownet, x, opt)
 
         if log_tensorboard:
-            writer.add_scalar("train_loss", loss, niter)
+            for loss_type in loss_dict:
+                writer.add_scalar(f"train_loss/{loss_type}", loss_dict[loss_type], niter)
 
         if niter % log_interval == 0:
             flownet.eval()
@@ -588,7 +666,7 @@ def train_msma_flow(
         # progbar.set_description(f"Loss: {loss:.4f}")
 
     torch.save(
-        {   
+        {
             "epoch": -1,
             "kimg": niter,
             "model_state_dict": flownet.state_dict(),
@@ -746,7 +824,10 @@ def main(network_pkl, **kwargs):
     )
 
     model_stats = summary(
-        flownet, input_size=(1, *train_ds.dataset.image_shape), verbose=1, depth=1,
+        flownet,
+        input_size=(1, *train_ds.dataset.image_shape),
+        verbose=1,
+        depth=1,
     )
 
     # Train
