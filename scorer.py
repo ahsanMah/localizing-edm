@@ -287,6 +287,24 @@ def compute_scores(
 
     return scores
 
+def build_img_grid(imgs, rows):
+    b,c,h,w = imgs.shape
+    cols = b // rows
+    # Channels last
+    img = imgs.permute(0,2,3,1).cpu()
+    # Make grid of images
+    # (x,y), h,w,c
+    img = img.reshape(rows,cols,h,w,c)
+    # Swap half batch across cols
+    # And half across rows
+    # x,h y,w, c
+    img = img.permute(0,2,1,3,4)
+    # for each img_row,
+    #    each pixel row will have y images concatted
+    #  every subsewuent will
+    img = img.reshape(h*rows, w*cols, c)
+    
+    return img
 
 def plot_score_grid(scores, num_samples=9, plot_sigma_idxs=[0, 5, 10, 19]):
     if isinstance(scores, torch.Tensor):
