@@ -1,86 +1,34 @@
+import json
+import math
 import os
+import pickle
+from functools import partial
+
+import click
 import FrEIA.framework as Ff
 import FrEIA.modules as Fm
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
-import numpy as np
-from tqdm.auto import tqdm
-from scorer import EDMScorer, VEScorer
-
-import pickle
-import dnnlib
-from torch.utils.data import Subset
-from functools import partial
-import click
-import pandas as pd
-from torch.utils.tensorboard import SummaryWriter
-import json
-from torchinfo import summary
 from torch.nn.functional import interpolate
-import math
-from torch_utils import misc
+from torch.utils.data import Subset
+from torch.utils.tensorboard import SummaryWriter
+from torchinfo import summary
+from tqdm.auto import tqdm
 
+import dnnlib
+from flow_utils import (
+    build_conv_model,
+    positionalencoding2d,
+    subnet_fc,
+)
+from scorer import EDMScorer, VEScorer
+from torch_utils import misc
 
 _GCONST_ = -0.9189385332046727 # ln(sqrt(2*pi))
 def logprob(z, ldj):
     return _GCONST_ - 0.5 * torch.sum(z**2, dim=1) + ldj
-
-def subnet_fc(c_in, c_out, ndim=128):
-    return nn.Sequential(
-        nn.Linear(c_in, ndim),
-        nn.GELU(),
-        nn.Linear(ndim, ndim),
-        nn.GELU(),
-        nn.Linear(ndim, c_out),
-    )
-
-
-def subnet_conv(c_in, c_out, ndim=256):
-    return nn.Sequential(
-        nn.Conv2d(c_in, ndim, 3, padding=1),
-        nn.SiLU(),
-        nn.Conv2d(ndim, c_out, 3, padding=1),
-    )
-
-
-def subnet_conv_1x1(c_in, c_out, ndim=256):
-    return nn.Sequential(nn.Conv2d(c_in, ndim, 1), nn.GELU(), nn.Conv2d(ndim, c_out, 1))
-
-
-# Taken from CFlow-AD repo
-# https://github.com/gudovskiy/cflow-ad/blob/b2ebf9e673a0aa46992a3b18367ec066a57bba89/model.py
-def positionalencoding2d(D, H, W):
-    """
-    :param D: dimension of the model
-    :param H: H of the positions
-    :param W: W of the positions
-    :return: DxHxW position matrix
-    """
-    if D % 4 != 0:
-        raise ValueError(
-            "Cannot use sin/cos positional encoding with odd dimension (got dim={:d})".format(
-                D
-            )
-        )
-    P = torch.zeros(D, H, W)
-    # Each dimension use half of D
-    D = D // 2
-    div_term = torch.exp(torch.arange(0.0, D, 2) * -(math.log(1e4) / D))
-    pos_w = torch.arange(0.0, W).unsqueeze(1)
-    pos_h = torch.arange(0.0, H).unsqueeze(1)
-    P[0:D:2, :, :] = (
-        torch.sin(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
-    )
-    P[1:D:2, :, :] = (
-        torch.cos(pos_w * div_term).transpose(0, 1).unsqueeze(1).repeat(1, H, 1)
-    )
-    P[D::2, :, :] = (
-        torch.sin(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
-    )
-    P[D + 1 :: 2, :, :] = (
-        torch.cos(pos_h * div_term).transpose(0, 1).unsqueeze(2).repeat(1, 1, W)
-    )
-    return P
 
 
 class PatchFlow(torch.nn.Module):
@@ -242,7 +190,7 @@ class PatchFlow(torch.nn.Module):
         # Swap batch and patch dim
         x = x.permute(1, 0)
         x = x.reshape(x.shape[0], *self.spatial_res)
-        return x  # + hres_logpx
+        return x  #+ (hres_logpx / self.num_patches)
 
     def log_density(self, x):
         self.eval()
@@ -353,128 +301,6 @@ def load_pretrained_model(network_pkl):
 
     net = model["ema"]
     return net, config
-
-
-# TODO: Make a U-Net style model
-def build_conv_model(
-    input_dims, num_filters=256, levels=2, num_blocks=2, num_fc_blocks=0, unet=False
-):
-    nodes = [Ff.InputNode(*input_dims, name="input")]
-
-    # Higher resolution convolutional part
-    for k in range(num_blocks):
-        nodes.append(
-            Ff.Node(
-                nodes[-1],
-                Fm.AllInOneBlock,
-                {"subnet_constructor": subnet_conv},
-                name=f"conv_high_res_{k}",
-            )
-        )
-        # nodes.append(
-        #     Ff.Node(
-        #         nodes[-1],
-        #         Fm.AllInOneBlock,
-        #         {"subnet_constructor": subnet_conv, "gin_block": False},
-        #     )
-        # )
-
-    # Lower resolution convolutional part
-    levels -= 1
-    for i in range(levels):
-        nodes.append(
-            Ff.Node(nodes[-1], Fm.IRevNetDownsampling, {}, name=f"downsample_{i}")
-        )
-
-        for k in range(num_blocks):
-            if k % 2 == 0:
-                subnet = partial(subnet_conv_1x1, ndim=num_filters)
-            else:
-                subnet = partial(subnet_conv, ndim=num_filters)
-
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv},
-                    name=f"conv_high_res_{k}",
-                )
-            )
-
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv_1x1},
-                )
-            )
-
-    if unet:
-        # Upsampling part
-        for i in range(levels):
-            nodes.append(Ff.Node(nodes[-1], Fm.HaarUpsampling, {}))
-
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv},
-                    name=f"conv_high_res_{k}",
-                )
-            )
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv, "gin_block": True},
-                )
-            )
-
-    if num_fc_blocks > 0:
-        ndim_x = np.prod(input_dims)
-        # Make the outputs into a vector, then split off 1/4 of the outputs for the
-        # fully connected part
-        nodes.append(Ff.Node(nodes[-1], Fm.Flatten, {}, name="flatten"))
-        split_node = Ff.Node(
-            nodes[-1],
-            Fm.Split,
-            {"section_sizes": (ndim_x // 4, 3 * ndim_x // 4), "dim": 0},
-            name="split",
-        )
-        nodes.append(split_node)
-
-        # Fully connected part
-        for k in range(num_fc_blocks):
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.GLOWCouplingBlock,
-                    {"subnet_constructor": subnet_fc, "clamp": 2.0},
-                    name=f"fully_connected_{k}",
-                )
-            )
-            nodes.append(
-                Ff.Node(nodes[-1], Fm.PermuteRandom, {"seed": k}, name=f"permute_{k}")
-            )
-
-        # Concatenate the fully connected part and the skip connection to get a single output
-        nodes.append(
-            Ff.Node(
-                [nodes[-1].out0, split_node.out1],
-                Fm.Concat1d,
-                {"dim": 0},
-                name="concat",
-            )
-        )
-
-        nodes.append(
-            Ff.Node(nodes[-1], Fm.Reshape, {"output_dims": input_dims}, name="reshape")
-        )
-
-    nodes.append(Ff.OutputNode(nodes[-1], name="output"))
-    conv_inn = Ff.GraphINN(nodes)
-
-    return conv_inn
 
 
 # @torch.inference_mode()

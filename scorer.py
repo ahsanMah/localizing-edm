@@ -35,6 +35,7 @@ class EDMScorer(torch.nn.Module):
         sigma_max=float("inf"),  # Maximum supported noise level.
         sigma_data=0.5,  # Expected standard deviation of the training data.
         rho=7,  # Time step discretization.
+        device=torch.device("cpu"),  # Device to use.
         num_steps=20,  # Number of nosie levels to evaluate.
     ):
         super().__init__()
@@ -174,7 +175,7 @@ class VEScorer(torch.nn.Module):
             if debug:
                 print("c_in:", c_skip)
                 print("c_noise:", c_noise)
-                print("c_out:", c_out)
+                # print("c_out:", c_out)
 
         if self.downsample:
             batch_scores = self.norm_pool(batch_scores)
