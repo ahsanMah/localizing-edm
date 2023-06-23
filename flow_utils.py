@@ -11,6 +11,26 @@ import torch
 import torch.nn as nn
 import torchvision.utils as vutils
 
+
+class SpatialNorm2D(nn.Module):
+    def __init__(self, in_channels, kernel_size=3, stride=2, padding=1):
+        super().__init__()
+        self.conv = nn.Conv2d(
+            in_channels,
+            in_channels,
+            kernel_size,
+            groups=in_channels,
+            stride=stride,
+            padding=padding,
+            bias=False,
+        )
+        self.conv.weight.data.fill_(1)  # all ones weights
+        self.conv.weight.requires_grad = False  # freeze weights
+
+    @torch.no_grad()
+    def forward(self, x):
+        return self.conv(x.square()).pow_(0.5)
+
 # Taken from https://github.com/y0ast/Glow-PyTorch/blob/13c7b013dde32600e732416f2ed15438d686636f/modules.py#LL217C1-L244C68
 class Conv2dZeros(nn.Module):
     def __init__(
@@ -117,8 +137,13 @@ def build_conv_model(
 ):
     nodes = [Ff.InputNode(*input_dims, name="input")]
 
+    if isinstance(num_blocks, int):
+        highres_blocks = lowres_blocks = num_blocks
+    else:
+        highres_blocks, lowres_blocks = num_blocks
+
     # Higher resolution convolutional part
-    for k in range(num_blocks):
+    for k in range(highres_blocks):
         nodes.append(
             Ff.Node(
                 nodes[-1],
@@ -135,7 +160,7 @@ def build_conv_model(
             Ff.Node(nodes[-1], Fm.HaarDownsampling, {}, name=f"downsample_{i}")
         )
 
-        for k in range(num_blocks):
+        for k in range(lowres_blocks):
             if k % 2 == 0:
                 subnet = partial(subnet_conv_1x1, ndim=num_filters)
             else:
@@ -156,21 +181,15 @@ def build_conv_model(
         for i in range(levels):
             nodes.append(Ff.Node(nodes[-1], Fm.HaarUpsampling, {}))
 
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv},
-                    name=f"conv_high_res_{k}",
+            for k in range(num_blocks):
+                nodes.append(
+                    Ff.Node(
+                        nodes[-1],
+                        Fm.AllInOneBlock,
+                        {"subnet_constructor": subnet_conv},
+                        name=f"conv_high_res_{k}",
+                    )
                 )
-            )
-            nodes.append(
-                Ff.Node(
-                    nodes[-1],
-                    Fm.AllInOneBlock,
-                    {"subnet_constructor": subnet_conv, "gin_block": True},
-                )
-            )
 
     if num_fc_blocks > 0:
         ndim_x = np.prod(input_dims)
@@ -234,9 +253,9 @@ def plot_batch_with_heatmaps(images_batch, anomaly_maps, clip_val=None, grid_siz
     
     # Putting batch as "channel" dimension
     # so kernel is run over all batches (independently)
-    # anomaly_maps = anomaly_maps.transpose(1,2,0)
-    # anomaly_maps = cv.blur(anomaly_maps, ksize=(blur_radius,blur_radius))
-    # anomaly_maps = anomaly_maps.transpose(2,0,1)
+    anomaly_maps = anomaly_maps.transpose(1,2,0)
+    anomaly_maps = cv.blur(anomaly_maps, ksize=(blur_radius,blur_radius))
+    anomaly_maps = anomaly_maps.transpose(2,0,1)
     
     # Min-Max Scaling
     amin = anomaly_maps.min(axis=(1,2), keepdims=True)
