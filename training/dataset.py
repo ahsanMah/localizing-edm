@@ -268,7 +268,7 @@ class MVTecDataset(Dataset):
         # self.cfg = config # MVTec dataset folder path
  
         self.category = category = path.split("/")[-1]
-        assert category in MVTecDataset.CATEGORY, "Category {category} should be one of {}".format(MVTecDataset.CATEGORY)
+        assert category in MVTecDataset.CATEGORY, f"Category {category} should be one of {MVTecDataset.CATEGORY}"
         self.train_set = train
         self.root_path = path
         self._path = os.path.join(path, "train" if train else "test")
