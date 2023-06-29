@@ -69,7 +69,7 @@ class EDMScorer(torch.nn.Module):
             c_in = 1 / (self.sigma_data**2 + sigma**2).sqrt()
             c_skip = self.sigma_data**2 / (sigma**2 + self.sigma_data**2)
             print("c_in:", c_in)
-            xin = (c_in.to(torch.float32) * x)
+            xin = c_in.to(torch.float32) * x
             xin = xin.to(dtype)
             score = self.model(
                 xin,
@@ -196,30 +196,60 @@ class VEScorer(torch.nn.Module):
         else:
             c_out = 1
 
-        c_noise = (0.5 * self.sigma_steps).log().float()
+        c_noise = (0.5 * self.sigma_steps).log().to(torch.float32)
         num_steps = self.num_steps
 
         def forward(
             x,
-            class_labels=None,
-            num_steps=num_steps,
-            dtype=dtype,
+            chunks=5,
+            # num_steps=num_steps,
+            # dtype=dtype,
         ):
-            x = x.to(torch.float32)
-            n, c, h, w = x.shape
+            x = x.to(dtype)
+            b, c, h, w = x.shape
 
             x_batch = x.repeat_interleave(num_steps, dim=0)
+            c_batch = c_noise.repeat(x.shape[0]).flatten()
 
-            batch_scores = self.model(
-                x_batch.to(dtype),
-                c_noise.repeat(x.shape[0]).flatten(),
-                class_labels=class_labels,
+
+            # Compute scores in chunks.
+            # Each chunk is a view according to torch documentation
+            
+            # batch_scores = []
+            # for xc, cc in zip(x_batch.chunk(chunks), c_batch.chunk(chunks)):
+            #     # print(xc.shape, cc.shape)
+            #     batch_scores.append(
+            #         self.model(
+            #             xc,
+            #             cc,
+            #             class_labels=None,
+            #         ).mean(dim=1)
+            #     )
+            # batch_scores = torch.cat(batch_scores, dim=0)
+
+            n = x_batch.shape[0]
+            batch_scores = torch.zeros(
+                size=(n, h, w),
+                device=x.device,
+                dtype=torch.float16,
+                requires_grad=False,
             )
 
-            batch_scores = batch_scores.reshape(n, self.num_steps, c, h, w)
-            batch_scores = batch_scores.mean(dim=2).to(torch.float32)
+            # Compute scores in chunks.
+            chunk_size = n // chunks
+            for i in range(0, n, chunk_size):
+                xc = x_batch[i : i + chunk_size]
+                cc = c_batch[i : i + chunk_size]
 
-            batch_scores = c_out * batch_scores
+                batch_scores[i : i + chunk_size] = self.model(
+                        xc,
+                        cc,
+                        class_labels=None,
+                    ).mean(dim=1)
+
+
+            batch_scores = batch_scores.reshape(b, self.num_steps, h, w)
+            batch_scores = batch_scores.to(torch.float32) * c_out
 
             return batch_scores
 
