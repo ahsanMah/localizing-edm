@@ -164,6 +164,7 @@ def training_loop(
         tick_end_time = time.time()
         fields = []
         fields += [f"tick {training_stats.report0('Progress/tick', cur_tick):<5d}"]
+        fields += [f"loss/gpu-batch {training_stats.report0('Loss/gpu-batch', loss.mean()):<9.4f}"]
         fields += [f"kimg {training_stats.report0('Progress/kimg', cur_nimg / 1e3):<9.1f}"]
         fields += [f"time {dnnlib.util.format_time(training_stats.report0('Timing/total_sec', tick_end_time - start_time)):<12s}"]
         fields += [f"sec/tick {training_stats.report0('Timing/sec_per_tick', tick_end_time - tick_start_time):<7.1f}"]
