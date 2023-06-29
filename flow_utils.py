@@ -13,16 +13,23 @@ import torchvision.utils as vutils
 
 
 class ScoreAttentionBlock(nn.Module):
-    def __init__(self, input_size, embed_dim, num_heads=4):
+    def __init__(self, input_size, embed_dim, outdim=None, num_heads=4, dropout=0.1):
         super().__init__()
         num_sigmas, h, w = input_size
-        self.proj = nn.Parameter(torch.zeros(num_sigmas, embed_dim))
+        outdim = outdim or embed_dim
+
+        self.proj = nn.Linear(num_sigmas, embed_dim, bias=False)
         self.norm = nn.LayerNorm(embed_dim)
         self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
         pos = positionalencoding2d(embed_dim, h, w)
         pos = pos.reshape(1, embed_dim, h * w).permute(0, 2, 1)  # (B) N x C_d
         self.register_buffer("positional_encoding", pos)
+
+        self.ffn = nn.Sequential(nn.Linear(embed_dim, outdim, bias=False),nn.ReLU(),
+                                 nn.Dropout(dropout),nn.Linear(outdim, outdim, bias=False))
+        self.normout = nn.LayerNorm(outdim)
+        
 
     def forward(self, x, attn_mask=None):
         # Making batch first to trigger flash attention
@@ -31,15 +38,19 @@ class ScoreAttentionBlock(nn.Module):
             x.shape[1] == self.positional_encoding.shape[1]
         ), "Can only be called on flattened image"
 
-        x = x @ self.proj
+        x = self.proj(x)
+        # x = x @ self.proj
         x = self.norm(x.add_(self.positional_encoding))
 
-        x, attn = self.attention(
+        h, attn = self.attention(
             x,
             x,
             x,
             attn_mask=attn_mask,
         )
+
+        x = self.normout(self.ffn(x + h))
+
         x = x.permute(1, 0, 2)
         return x, attn
 
