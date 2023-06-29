@@ -18,15 +18,22 @@ from torchinfo import summary
 from tqdm.auto import tqdm
 
 import dnnlib
-from flow_utils import build_conv_model, positionalencoding2d, subnet_fc, SpatialNorm2D
+from flow_utils import (
+    build_conv_model,
+    positionalencoding2d,
+    subnet_fc,
+    SpatialNorm2D,
+    ScoreAttentionBlock,
+)
 from scorer import EDMScorer, VEScorer
 from torch_utils import misc
+import pdb
 
 _GCONST_ = -0.9189385332046727  # ln(sqrt(2*pi))
 
 
 def logprob(z, ldj):
-    return _GCONST_ - 0.5 * torch.sum(z**2, dim=1) + ldj
+    return _GCONST_ - 0.5 * torch.sum(z**2, dim=-1) + ldj
 
 
 class PatchFlow(torch.nn.Module):
@@ -66,20 +73,28 @@ class PatchFlow(torch.nn.Module):
         self,
         input_size,
         patch_size=3,
-        spatial_cond_dim=32,
+        spatial_cond_dim=128,
         num_blocks=2,
+        global_flow=False,
+        patch_batch_size=128,
     ):
         super().__init__()
         assert (
             patch_size in PatchFlow.patch_config
         ), f"PatchFlow only support certain patch sizes: {PatchFlow.patch_config.keys()}"
         channels = input_size[0]
+        
+        # Used to chunk the input into in fast_forward (vectorized) 
+        self.patch_batch_size = patch_batch_size
+
+        self.use_global_context = global_flow
+
 
         with torch.no_grad():
             # Pooling for global "high resolution" flow
-            self.global_pooler = SpatialNorm2D(
-                channels,  # **PatchFlow.patch_config[3]["global"]
-            ).requires_grad_(False)
+            # self.global_pooler = SpatialNorm2D(
+            #     channels,  # **PatchFlow.patch_config[3]["global"]
+            # ).requires_grad_(False)
 
             # Pooling for local "patch" flow
             # Each patch-norm is input to the shared conditional flow model
@@ -103,12 +118,9 @@ class PatchFlow(torch.nn.Module):
             print(f"Number of flows / patches: {self.num_patches}")
 
         # _b, c, h, w = self.global_pooler(torch.empty(1, *input_size)).shape
-        #     self.global_pooler,
         # self.global_flow = nn.Sequential(
+        #     global_pooler,
         #     build_conv_model((c, h, w), levels=2, num_blocks=num_blocks // 2, unet=False),
-        # # )
-        # self.global_flow = build_conv_model(
-        #     (c, h, w), levels=2, num_blocks=num_blocks // 2, unet=False
         # )
 
         # # Output of high res flow is downsampled to match the spatial resolution of the patches
@@ -117,7 +129,22 @@ class PatchFlow(torch.nn.Module):
         # global_cond_dim = channels * 4
 
         cond_dims = spatial_cond_dim
-        # cond_dims += global_cond_dim
+
+        if self.use_global_context:
+            # self.global_flow = build_conv_model(
+            #     input_size, levels=2, num_blocks=[num_blocks//2, num_blocks], unet=False
+            # )
+            # self.global_flow = torch.nn.Sequential(
+            #     nn.AdaptiveAvgPool2d((h*2, w*2)),
+            #     self.global_flow,
+            # )
+            # global_cond_dim = channels
+            # self.global_pooler = nn.AdaptiveAvgPool2d((h//2, w//2))
+            self.global_attention = ScoreAttentionBlock(
+                input_size=(c, h, w), embed_dim=cond_dims
+            )
+            cond_dims += cond_dims
+
         num_features = low_res_channels  # + global_cond_dim
         self.flow = self.build_cflow_head(cond_dims, num_features, num_blocks)
 
@@ -130,12 +157,13 @@ class PatchFlow(torch.nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias.data)
 
-        # for m in self.global_flow.modules():
-        #     if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-        #         # print(m)
-        #         nn.init.xavier_uniform_(m.weight.data)
-        #         if m.bias is not None:
-        #             nn.init.zeros_(m.bias.data)
+        if self.use_global_context:
+            for m in self.global_attention.modules():
+                if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
+                    # print(m)
+                    nn.init.xavier_uniform_(m.weight.data)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias.data)
 
     def build_cflow_head(self, n_cond, n_feat, num_blocks=2):
         coder = Ff.SequenceINN(n_feat)
@@ -148,6 +176,7 @@ class PatchFlow(torch.nn.Module):
                 subnet_constructor=subnet_fc,
                 global_affine_type="SOFTPLUS",
                 permute_soft=True,
+                affine_clamping=1.9,
             )
 
         return coder
@@ -159,182 +188,254 @@ class PatchFlow(torch.nn.Module):
         x = x.reshape(self.num_patches, b, c)
         return x
 
+    def forward(self, x, return_attn=False, fast=True):
+        B = x.shape[0]
+        x = self.local_pooler(x)
+        local_patches = self.patchify(x)  # Patches x batch x channels
+        context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+
+        mask = torch.eye(
+            self.num_patches, dtype=torch.bool, device=x.device, requires_grad=False
+        )
+
+        global_context, attn_maps = self.global_attention(local_patches, mask)
+        context = torch.cat([context, global_context], dim=-1)
+
+        if fast:
+            zs, log_jac_dets = self.fast_forward(local_patches, context)
+
+        else:
+            zs = []
+            log_jac_dets = []
+
+            for patch_feature, context_vector in zip(local_patches, context):
+                # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
+                z, ldj = self.flow(
+                    patch_feature,
+                    c=[context_vector],
+                    # torch.cat([patch_feature, glb_ctx], dim=-1),
+                    # c=[spatial_cond],
+                )
+                zs.append(z)
+                log_jac_dets.append(ldj)
+
+        if return_attn:
+            return zs, log_jac_dets, attn_maps
+
+        return zs, log_jac_dets
+
+    def fast_forward(self, x, ctx):
+
+        assert self.num_patches % self.patch_batch_size == 0, "Need patch batch size to be disible by total number of patches"
+        chunk_size = self.num_patches // self.patch_batch_size
+        P,B,C = x.shape
+        _,_,D = ctx.shape
+        x, ctx = x.reshape(P*B, C), ctx.reshape(P*B, D)
+        x, ctx = x.chunk(chunk_size, dim=0), ctx.chunk(chunk_size, dim=0)
+        zs, jacs, = [], []
+        
+        for p, c in zip(x, ctx):
+            # assert torch.isclose(c[0, :32], c[B-1, :32]).all() # Check that patch context is same for all batch elements
+            # assert torch.isclose(c[B+1, :32], c[(2*B)-1, :32]).all()
+            z, ldj = self.flow(
+                p,
+                c=[c],
+            )
+            zs.append(z)
+            jacs.append(ldj)
+        
+        zs = torch.cat(zs, dim=0).reshape(self.num_patches, B, C)
+        jacs = torch.cat(jacs, dim=0).reshape(self.num_patches, B)
+
+        return zs, jacs
+
+    def stochastic_train_step(self, x, opt, n_patches=1):
+        B = x.shape[0]
+        x = self.local_pooler(x)
+        local_patches = self.patchify(x)  # Patches x batch x channels
+        context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+
+        G = self.global_attention
+        # global_context =
+        # global_context, attn_maps = self.global_attention(local_patches)
+        # context = torch.cat([context, global_context], dim=-1)
+        mask = torch.eye(
+            self.num_patches, dtype=torch.bool, device=x.device, requires_grad=False
+        )
+
+        rand_idx = torch.randperm(self.num_patches)[:n_patches]
+        local_loss = 0.0
+        global_loss = 0.0
+        for idx in rand_idx:
+            patch_feature, context_vector = (
+                local_patches[idx],
+                context[idx],
+            )
+
+            # Need separate loss for each patch
+            glb_ctx = G.proj(local_patches.permute(1, 0, 2))
+            glb_ctx = G.norm(glb_ctx.add_(G.positional_encoding))
+            # print("GLOBAL CTX:",glb_ctx.shape)
+            p = glb_ctx[:, [idx], :]
+            p_ctx, attn_maps = G.attention(p, glb_ctx, glb_ctx, attn_mask=mask[idx].unsqueeze(0))
+            p_ctx = G.normout(G.ffn(p + p_ctx))
+            p_ctx = p_ctx.squeeze(1)
+            # print(p_ctx.shape, attn_maps.shape)
+            context_vector = torch.cat([context_vector, p_ctx], dim=-1)
+
+            z, ldj = self.flow(
+                patch_feature,
+                c=[context_vector],
+            )
+
+            opt.zero_grad(set_to_none=True)
+            loss = nll(z, ldj)
+            loss.backward(retain_graph=True)
+            name, p = G.named_parameters().__next__()
+            # print(name, p.grad.mean())
+            opt.step()
+            local_loss += loss.item()
+            global_loss += attn_maps.mean().item()
+
+        return global_loss, local_loss
+
     # def forward(self, x):
     #     B = x.shape[0]
-    #     hres_zs, hres_log_jac_dets = self.global_flow(x)
-    #     global_context_patches = self.patchify(hres_zs)
 
-    #     x = self.local_pooler(x)
-    #     local_patches = self.patchify(x)  # Patches x batch x channels
-
-    #     zs = [hres_zs.reshape(B, -1)]
-    #     log_jac_dets = [hres_log_jac_dets]
-    #     pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
-    #     for patch_feature, glb_ctx, spatial_cond in zip(
-    #         local_patches, global_context_patches, pos
-    #     ):
-    #         # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
-    #         z, ldj = self.flow(
-    #             patch_feature,
-    #             c=[torch.cat([glb_ctx, spatial_cond], dim=-1)],
-    #             # torch.cat([patch_feature, glb_ctx], dim=-1),
-    #             # c=[spatial_cond],
-    #         )
-    #         zs.append(z)
-    #         log_jac_dets.append(ldj)
-
-    #     return zs, log_jac_dets
-
-    # def stochastic_train_step(self, x, n_patches=1):
-    #     B = x.shape[0]
-    #     hres_zs, hres_log_jac_dets = self.global_flow(x)
-    #     global_context_patches = self.patchify(hres_zs)
-
-    #     x = self.local_pooler(x)
-    #     local_patches = self.patchify(x)  # Patches x batch x channels
+    #     # x = self.local_pooler(x)
+    #     local_patches = self.patchify(self.local_pooler(x))  # Patches x batch x channels
 
     #     zs = []
     #     log_jac_dets = []
-    #     pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+    #     context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
 
-    #     rand_idx = torch.randperm(self.num_patches)[:n_patches]
-    #     for idx in rand_idx:
-    #         patch_feature, glb_ctx, spatial_cond = (
-    #             local_patches[idx],
-    #             global_context_patches[idx],
-    #             pos[idx],
-    #         )
+    #     if self.use_global_context:
+    #         hres_zs, hres_log_jac_dets = self.global_flow(x)
+    #         global_context_patches = self.patchify(hres_zs)
+    #         context = torch.cat([context, global_context_patches], dim=-1)
+    #         zs.append(hres_zs.reshape(B, -1))
+    #         log_jac_dets.append(hres_log_jac_dets)
+
+    #     for patch_feature, context_vector in zip(local_patches,context,):
     #         z, ldj = self.flow(
     #             patch_feature,
-    #             c=[torch.cat([glb_ctx, spatial_cond], dim=-1)],
-    #             # torch.cat([patch_feature, glb_ctx], dim=-1),
-    #             # c=[spatial_cond],
+    #             c=[context_vector],
     #         )
     #         zs.append(z)
     #         log_jac_dets.append(ldj)
 
     #     return zs, log_jac_dets
 
-    def forward(self, x):
-        B = x.shape[0]
+    # def stochastic_train_step(self, x, opt, n_patches=1):
+    #     B = x.shape[0]
 
-        x = self.local_pooler(x)
-        local_patches = self.patchify(x)  # Patches x batch x channels
+    #     # x = self.local_pooler(x)
+    #     # print(x)
+    #     # print("hres:", self.global_pooler(x))
+    #     local_patches = self.patchify(self.local_pooler(x))  # Patches x batch x channels
 
-        zs = []
-        log_jac_dets = []
-        pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
-        for patch_feature, spatial_cond in zip(local_patches, pos):
-            # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
-            z, ldj = self.flow(
-                patch_feature,
-                c=[spatial_cond],
-                # torch.cat([patch_feature, glb_ctx], dim=-1),
-            )
-            zs.append(z)
-            log_jac_dets.append(ldj)
+    #     # zs = []
+    #     # log_jac_dets = []
+    #     context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
 
-        return zs, log_jac_dets
+    #     global_loss = 0.0
+    #     if self.use_global_context:
+    #         # print("using global context - before:", context.shape)
+    #         # Likeilihood step for global flow
+    #         hres_zs, hres_log_jac_dets = self.global_flow(x)
+    #         opt.zero_grad(set_to_none=True)
+    #         loss = nll(hres_zs.reshape(B,-1), hres_log_jac_dets) / n_patches
+    #         loss.backward()
+    #         name,p = self.global_flow.named_parameters().__next__()
+    #         print(name, p.grad.mean())
+    #         opt.step()
+    #         global_loss += loss.item()
 
-    def stochastic_train_step(self, x, n_patches=1):
-        B = x.shape[0]
+    #         # Global flow will be used in context loss
+    #         hres_zs, hres_log_jac_dets = self.global_flow(x)
+    #         global_context_patches = self.patchify(hres_zs)
+    #         context = torch.cat([context, global_context_patches], dim=-1)
+    #         # print("using global context:", context.shape, global_context_patches.shape)
+    #         # zs.append(hres_zs.reshape(B, -1))
+    #         # log_jac_dets.append(hres_log_jac_dets)
+    #         # print(context.shape)
 
-        x = self.local_pooler(x)
-        # print(x)
-        # print("hres:", self.global_pooler(x))
-        local_patches = self.patchify(x)  # Patches x batch x channels
+    #     local_loss = 0.0
+    #     rand_idx = torch.randperm(self.num_patches)[:n_patches]
+    #     for idx in rand_idx:
+    #         patch_feature, context_vector = (
+    #             local_patches[idx],
+    #             context[idx],
+    #         )
+    #         z, ldj = self.flow(
+    #             patch_feature,
+    #             c=[context_vector],
+    #         )
+    #         # zs.append(z)
+    #         # log_jac_dets.append(ldj)
 
-        zs = []
-        log_jac_dets = []
-        pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
+    #         opt.zero_grad(set_to_none=True)
+    #         loss = nll(z, ldj)
+    #         loss.backward(retain_graph=True)
+    #         name,p = self.global_flow.named_parameters().__next__()
+    #         print(name, p.grad.mean())
+    #         opt.step()
+    #         local_loss += loss.item()
 
-        rand_idx = torch.randperm(self.num_patches)[:n_patches]
-        for idx in rand_idx:
-            patch_feature, spatial_cond = (
-                local_patches[idx],
-                pos[idx],
-            )
-            z, ldj = self.flow(
-                patch_feature,
-                c=[spatial_cond],
-                # torch.cat([patch_feature, glb_ctx], dim=-1),
-            )
-            zs.append(z)
-            log_jac_dets.append(ldj)
+    #     return global_loss, local_loss
 
-        return zs, log_jac_dets
-
-    def reverse(self, zs):
-        B = zs[0].shape[0]
-        pos = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
-        xs = []
-
-        for i, (patch_feature, spatial_cond) in enumerate(zip(zs, pos)):
-            x, ldj = self.flow(
-                patch_feature,
-                c=[
-                    spatial_cond,
-                ],
-                rev=True,
-            )
-            xs.append(x)
-        return xs
-
-    def reconstruct(self, zs):
+    def reconstruct(self, logpxs):
         """
         Reconstructs image from a list of patch densities
         """
-        # hres_logpx = zs.pop(0)[:, None, None]
+        # if self.use_global_context:
+        #     hres_logpx = zs.pop(0)[:, None, None]
+
         # x is num_patches x batch
-        x = torch.stack(zs)
+        if isinstance(logpxs, list):
+            x = torch.stack(logpxs)
+        else:
+            x = logpxs
         # Swap batch and patch dim
         x = x.permute(1, 0)
         x = x.reshape(x.shape[0], *self.spatial_res)
-        return x #+ (hres_logpx / self.num_patches)
 
-    def log_density(self, x):
+        # if self.use_global_context:
+        #     x = x + hres_logpx / self.num_patches
+
+        return x
+
+    @torch.no_grad()
+    def log_density(self, x, fast=True):
         self.eval()
-        with torch.no_grad():
-            zs, jacs = self(x)
-            logpzs = [-0.5 * torch.sum(z**2, dim=1) + ldj for z, ldj in zip(zs, jacs)]
-            logpx = self.reconstruct(logpzs)
+        zs, jacs = self.forward(x, fast=fast)
+
+        if isinstance(zs, list):
+            zs = torch.stack(zs)
+            jacs = torch.stack(jacs)
+        assert zs.dim() == 3
+        # if self.use_global_context:
+        #     hres_logpx = zs.pop(0)
+        #     hres_jac = jacs.pop(0)[:, None, None]
+        #     hres_logpx = hres_logpx.reshape(
+        #         x.shape[0], self.channels, *self.spatial_res
+        #     )
+        #     hres_logpx = hres_logpx.sum(dim=1)
+        #     hres_logpx = hres_logpx + hres_jac / self.num_patches
+
+        # logpzs = [-0.5 * torch.sum(z**2, dim=1) + ldj for z, ldj in zip(zs, jacs)]
+        logpx = logprob(zs, jacs)
+
+        # x is num_patches x batch
+        # logpx = torch.stack(logpzs)
+        # Swap batch and patch dim
+        logpx = logpx.permute(1, 0)
+        logpx = logpx.reshape(x.shape[0], *self.spatial_res)
+
+        # if self.use_global_context:
+        #     logpx = logpx + hres_logpx  # / self.num_patches
+
         return logpx
-
-
-def patchflow_stochastic_step(flownet, x, opt, n_samples=128):
-    n_samples = min(n_samples, flownet.flow.num_patches)
-    scores = flownet.scorenet(x)
-    # print("SCORES", scores)
-    # Optimizing the highres flow
-    # Note this could be combined with the patch loss below
-    # But dual optimizer step is more stable
-    # opt.zero_grad(set_to_none=True)
-    # hres_zs, hres_log_jac_dets = flownet.flow.global_flow(scores)
-    # hres_loss = nll(hres_zs.reshape(x.shape[0], -1), hres_log_jac_dets)
-    # hres_loss = hres_loss / n_samples
-    # hres_loss.backward()
-    # opt.step()
-
-    hres_loss = 0.0
-    total_loss = 0.0  # hres_loss.item()
-    # Optimizing the patch flow
-    zs, log_jac_dets = flownet.flow.stochastic_train_step(scores, n_patches=n_samples)
-    patch_losses = [nll(z, ldj) for z, ldj in zip(zs, log_jac_dets)]
-    hres_loss = patch_losses[0]
-    loss = 0.0
-    opt.zero_grad(set_to_none=True)
-    for l in patch_losses:
-        loss = loss + l
-    loss.backward()
-    opt.step()
-
-    total_loss += loss.item()
-
-    return {
-        "loss": total_loss,
-        "global_loss": hres_loss.item(),
-        "local_loss": loss.item(),
-    }
 
 
 class ScoreFlow(torch.nn.Module):
@@ -389,8 +490,8 @@ class ScoreFlow(torch.nn.Module):
         return -self.log_density(x)
 
     @torch.inference_mode()
-    def score_patches(self, x):
-        return self.flow.log_density(self.scorenet(x))
+    def score_patches(self,x, fast=True):
+        return self.flow.log_density(self.fastscore(x), fast=fast)
 
 
 def load_pretrained_model(network_pkl):
@@ -479,6 +580,46 @@ def train_flow(
     return losses
 
 
+def patchflow_stochastic_step(flownet, x, opt, n_samples=128):
+    n_samples = min(n_samples, flownet.flow.num_patches)
+    scores = flownet.fastscore(x)
+    # print("SCORES", scores)
+    # Optimizing the highres flow
+    # Note this could be combined with the patch loss below
+    # But dual optimizer step is more stable
+    # opt.zero_grad(set_to_none=True)
+    # hres_zs, hres_log_jac_dets = flownet.flow.global_flow(scores)
+    # hres_loss = nll(hres_zs.reshape(x.shape[0], -1), hres_log_jac_dets)
+    # hres_loss = hres_loss / n_samples
+    # hres_loss.backward()
+    # opt.step()
+
+    # hres_loss = 0.0
+    # total_loss = 0.0  # hres_loss.item()
+    # # Optimizing the patch flow
+    # zs, log_jac_dets = flownet.flow.stochastic_train_step(scores, n_patches=n_samples)
+    # patch_losses = [nll(z, ldj) for z, ldj in zip(zs, log_jac_dets)]
+    # pdb.set_trace()
+    # hres_loss = patch_losses[0]
+    # losses = 0.0
+    # opt.zero_grad(set_to_none=True)
+    # for loss in patch_losses:
+    #     losses = losses + loss
+    # loss.backward()
+    # opt.step()
+
+    global_loss, local_loss = flownet.flow.stochastic_train_step(
+        scores, opt, n_patches=n_samples
+    )
+    total_loss = global_loss + local_loss
+
+    return {
+        "loss": total_loss,
+        "global_loss": global_loss,
+        "local_loss": local_loss,
+    }
+
+
 def patchflow_step(flownet, x, opt):
     # scores = flownet.scorenet(x)
     zs, log_jac_dets = flownet(x)
@@ -495,13 +636,13 @@ def patchflow_step(flownet, x, opt):
 
     opt.zero_grad(set_to_none=True)
     patch_losses = [nll(z, ldj) for z, ldj in zip(zs, log_jac_dets)]
-    loss = 0.0
-    for l in patch_losses:
-        loss += l
-    loss.backward()
+    losses = 0.0
+    for loss in patch_losses:
+        losses += loss
+    losses.backward()
     opt.step()
 
-    return loss.item()
+    return losses.item()
 
 
 def fastflow_step(flownet, x, opt):
@@ -573,12 +714,15 @@ def train_msma_flow(
                 val_loss = 0.0
                 x, _ = next(val_iter)
                 x = x.to(device).to(torch.float32) / 127.5 - 1
-                z, log_jac_det = flownet(x)
+                z, log_jac_det = flownet(x, vectorize=True)
                 if fastflow:
                     val_loss += logloss(z, log_jac_det).item()
                 else:
-                    for z, ldj in zip(z, log_jac_det):
-                        val_loss += nll(z, ldj).item()
+                    # print(z.shape, log_jac_det.shape)
+                    # pdb.set_trace()
+                    val_loss = logprob(z, log_jac_det).mean(-1).sum().item()
+                    # for z, ldj in zip(z, log_jac_det):
+                    #     val_loss += nll(z, ldj).item()
 
             flownet.train()
 
@@ -667,13 +811,19 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
 @click.option(
     "--resolution", default=None, type=int, help="Resolution of images to train on."
 )
-@click.option("--augment", default=0.1, help="Probability of augmentation.")
+@click.option("--augment", default=0.05, help="Probability of augmentation.")
 # Flow options
 @click.option(
     "--fastflow",
     default=False,
     type=bool,
     help="Whether to use a fully convolutional FastFlow-like model.",
+)
+@click.option(
+    "--global_flow",
+    default=False,
+    type=bool,
+    help="Additionaly condition using a convolutional flow on full image.",
 )
 @click.option("--sigma_min", default=0.1, help="Minimum sigma for the score norms.")
 @click.option("--num_sigmas", default=10, help="Number of sigmas for the score norms.")
@@ -709,6 +859,9 @@ def main(network_pkl, **kwargs):
     config = dnnlib.EasyDict(kwargs)
     c = dnnlib.EasyDict(**model_config)
     device = torch.device(config.device)
+
+    hparams = f"nb{config.num_blocks}-lr{config.lr}-bs{config.batch_size}-pbs{config.patch_batch_size}-kimg{config.kimg}-augp{config.augment}"
+    config["run_dir"] = f"{config.run_dir}/{hparams}"
 
     if config.resolution is not None:
         c.dataset_kwargs.resolution = int(config.resolution)
@@ -761,6 +914,8 @@ def main(network_pkl, **kwargs):
             ),
             num_blocks=config["num_blocks"],
             patch_size=7,
+            global_flow=config["global_flow"],
+            patch_batch_size=1024#config["patch_batch_size"],
         )
 
     # exit()
@@ -768,7 +923,7 @@ def main(network_pkl, **kwargs):
     flownet = ScoreFlow(
         inn,
         scorenet=scorenet,
-        vectorize=False,
+        vectorize=True,
         use_fp16=config["fp16"],
         num_sigmas=config["num_sigmas"],
         sigma_min=config["sigma_min"],
@@ -777,7 +932,7 @@ def main(network_pkl, **kwargs):
 
     model_stats = summary(
         flownet,
-        input_size=(1, *train_ds.dataset.image_shape),
+        input_size=(5, *train_ds.dataset.image_shape),
         verbose=1,
         depth=1,
     )
