@@ -18,14 +18,13 @@ import click
 
 # ----------------------------------------------------------------------------
 
-
+@torch.no_grad()
 def generate_image_grid(
     network_pkl,
     dest_path,
     img_resolution=None,
     seed=0,
-    gridw=8,
-    gridh=8,
+    grid=3,
     device=torch.device("cuda"),
     num_steps=18,
     sigma_min=0.002,
@@ -35,7 +34,8 @@ def generate_image_grid(
     S_min=0,
     S_max=float("inf"),
     S_noise=1,
-):
+):  
+    gridw = gridh = grid
     batch_size = gridw * gridh
     torch.manual_seed(seed)
 
@@ -130,7 +130,7 @@ def generate_image_grid(
     help="Where to save the output images",
     metavar="DIR",
     type=str,
-    required=True,
+    default=None,
 )
 @click.option(
     "--res",
@@ -139,7 +139,14 @@ def generate_image_grid(
     type=int,
     default=None,
 )
-def main(network_pkl, outdir, res):
+@click.option(
+    "--steps",
+    help="Number of diffusion steps",
+    metavar="INT",
+    type=int,
+    default=28,
+)
+def main(network_pkl, outdir, res, steps):
     # model_root = '/workspace/localizing-edm/workdir/pretrained_models'
     # generate_image_grid(f'{model_root}/edm-cifar10-32x32-uncond-ve.pkl',   'cifar10-32x32.png',  num_steps=18) # FID = 1.79, NFE = 35
 
@@ -149,9 +156,16 @@ def main(network_pkl, outdir, res):
     # generate_image_grid(f'{model_root}/edm-afhqv2-64x64-uncond-vp.pkl',  'afhqv2-64x64.png',   num_steps=40) # FID = 1.96, NFE = 79
     # generate_image_grid(f'{model_root}/edm-imagenet-64x64-cond-adm.pkl', 'imagenet-64x64.png', num_steps=256, S_churn=40, S_min=0.05, S_max=50, S_noise=1.003) # FID = 1.36, NFE = 511
 
-    model_name = network_pkl.split("/")[-1][:-4]
+    # model_name = network_pkl.split("/")[-1][:-4]
+    model_root = network_pkl.split("/")
+    model_name = model_root[-1][:-4]
+    
+    if outdir is None:
+        outdir = "/".join(model_root[:-1])
+
     generate_image_grid(
-        network_pkl, f"{outdir}/{model_name}.png", num_steps=28, img_resolution=res
+        network_pkl, f"{outdir}/{model_name}_steps={steps}.png", num_steps=steps, img_resolution=res,
+#        S_churn=40, S_min=0.05, S_max=50, S_noise=1.0030
     )  # FID = 1.36, NFE = 511
     # generate_image_grid(network_pkl, f"{outdir}/{model_name}.png", num_steps=128, S_churn=40, S_min=0.05, S_max=50, S_noise=1.0030) # FID = 1.36, NFE = 511
 
