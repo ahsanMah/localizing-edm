@@ -227,11 +227,11 @@ class PatchFlow(torch.nn.Module):
     def fast_forward(self, x, ctx):
 
         assert self.num_patches % self.patch_batch_size == 0, "Need patch batch size to be disible by total number of patches"
-        chunk_size = self.num_patches // self.patch_batch_size
+        nchunks = self.num_patches // self.patch_batch_size
         P,B,C = x.shape
         _,_,D = ctx.shape
         x, ctx = x.reshape(P*B, C), ctx.reshape(P*B, D)
-        x, ctx = x.chunk(chunk_size, dim=0), ctx.chunk(chunk_size, dim=0)
+        x, ctx = x.chunk(nchunks, dim=0), ctx.chunk(nchunks, dim=0)
         zs, jacs, = [], []
         
         for p, c in zip(x, ctx):
@@ -290,8 +290,8 @@ class PatchFlow(torch.nn.Module):
 
             opt.zero_grad(set_to_none=True)
             loss = nll(z, ldj)
-            loss.backward(retain_graph=True)
-            name, p = G.named_parameters().__next__()
+            loss.backward()
+            # name, p = G.named_parameters().__next__()
             # print(name, p.grad.mean())
             opt.step()
             local_loss += loss.item()
@@ -491,7 +491,7 @@ class ScoreFlow(torch.nn.Module):
 
     @torch.inference_mode()
     def score_patches(self,x, fast=True):
-        return self.flow.log_density(self.fastscore(x), fast=fast)
+        return -self.flow.log_density(self.fastscore(x), fast=fast)
 
 
 def load_pretrained_model(network_pkl):
@@ -582,7 +582,8 @@ def train_flow(
 
 def patchflow_stochastic_step(flownet, x, opt, n_samples=128):
     n_samples = min(n_samples, flownet.flow.num_patches)
-    scores = flownet.fastscore(x)
+    with torch.no_grad():
+        scores = flownet.fastscore(x, chunks=10)
     # print("SCORES", scores)
     # Optimizing the highres flow
     # Note this could be combined with the patch loss below
@@ -670,7 +671,7 @@ def train_msma_flow(
     patch_batch_size=32,
 ):
     losses = []
-    opt = torch.optim.Adam(flownet.flow.parameters(), lr=lr)
+    opt = torch.optim.AdamW(flownet.flow.parameters(), lr=lr, weight_decay=1e-5)
     batch_sz = train_ds.batch_size
     total_iters = kimg * 1000 // batch_sz + 1
     progbar = tqdm(range(total_iters))
@@ -720,7 +721,7 @@ def train_msma_flow(
                 else:
                     # print(z.shape, log_jac_det.shape)
                     # pdb.set_trace()
-                    val_loss = logprob(z, log_jac_det).mean(-1).sum().item()
+                    val_loss = -logprob(z, log_jac_det).mean(-1).sum().item()
                     # for z, ldj in zip(z, log_jac_det):
                     #     val_loss += nll(z, ldj).item()
 
@@ -851,6 +852,12 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
 @click.option("--device", default="cuda", help="Device to use.")
 @click.option("--seed", default=42, type=int, help="Device to use.")
 def main(network_pkl, **kwargs):
+    
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+    
     # Load network alongside with its training config.
     print('Loading network from "%s"' % network_pkl)
     scorenet, model_config = load_pretrained_model(network_pkl=network_pkl)
@@ -915,7 +922,7 @@ def main(network_pkl, **kwargs):
             num_blocks=config["num_blocks"],
             patch_size=7,
             global_flow=config["global_flow"],
-            patch_batch_size=1024#config["patch_batch_size"],
+            patch_batch_size=config["patch_batch_size"],
         )
 
     # exit()
