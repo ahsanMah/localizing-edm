@@ -11,6 +11,57 @@ import torch
 import torch.nn as nn
 import torchvision.utils as vutils
 
+class InvGMM(nn.Module):
+
+    def __init__(self, n_dims,cond_dim, n_mixture_components=3) -> None:
+        super().__init__()
+
+        self.n_dims = n_dims
+        self.n_mixture_components = n_mixture_components
+        self.n_U_elements =  n_U_elements = int(n_dims * (n_dims + 1) / 2)
+        # w + mu + U
+        self.params_dim = (n_mixture_components , n_mixture_components * n_dims , n_mixture_components * n_U_elements)
+        self.params_net = nn.Sequential([
+            nn.Linear(cond_dim, sum(self.params_dim)),
+            nn.ReLU(),
+            nn.Linear(sum(self.params_dim), sum(self.params_dim)),
+        ])
+
+        # Invertible GMM
+
+        inp = Ff.InputNode(n_dims, name='input')
+        c_w = Ff.ConditionNode(n_mixture_components, name='weights')
+        c_mu = Ff.ConditionNode(n_mixture_components, n_dims, name='means')
+        c_U = Ff.ConditionNode(n_mixture_components, n_U_elements, name='covariances')
+        c_i = Ff.ConditionNode(0, name='indices')
+        gmm = Ff.Node(inp,
+                Fm.GaussianMixtureModel,
+                {},
+                conditions=[c_w, c_mu, c_U, c_i],
+                name='gmm')
+        out = Ff.OutputNode(gmm, name='output')
+        self.gmm = Ff.GraphINN([inp, c_w, c_mu, c_U, c_i, gmm, out], verbose=True)
+
+    # Helper function to make sense of parameter network output
+    def get_gmm_params(self, y):
+        # Run the network and rearrange output by GMM component
+        mixture_coefficients = self.params_net(y)
+
+        # Extract the individual parameter values
+        w, mu, U_elements = torch.split(mixture_coefficients, self.params_dim, dim=-1)
+
+        mu = mu.reshape(-1, self.n_mixture_components, self.n_dims)
+        U_elements = U_elements.reshape(-1, self.n_mixture_components, self.n_U_elements)
+
+        # Normalize the mixture coefficients
+        w = Fm.GaussianMixtureModel.normalize_weights(w)
+
+        return w, mu, U_elements
+
+    def forward(self, x):
+        pass
+
+
 
 class ScoreAttentionBlock(nn.Module):
     def __init__(self, input_size, embed_dim, outdim=None, num_heads=4, dropout=0.1):
@@ -293,6 +344,7 @@ def build_conv_model(
 def plot_batch_with_heatmaps(
     images_batch,
     anomaly_maps,
+    ground_truth_masks=None,
     clip_val=None,
     grid_size=(5, 5),
     blur_radius=5,
@@ -353,6 +405,15 @@ def plot_batch_with_heatmaps(
     anomaly_maps_rgb = plt.get_cmap("jet")(scaled_heatmaps)[:, :, :, :3]
     anomaly_maps_rgb = torch.from_numpy(anomaly_maps_rgb).float()
     anomaly_maps_rgb = anomaly_maps_rgb.permute(0, 3, 1, 2)
+
+    if ground_truth_masks is not None:
+        # Use opencv to combine the images and anomaly maps
+        mask = np.expand_dims(ground_truth_masks, 1).repeat(3, 1).astype(np.float32)
+        # mask = cv.c
+        images_batch = images_batch.numpy()
+        # images_batch = cv.addWeighted(images_batch, 0.5, mask, 0.5, 0)
+        images_batch = images_batch * 0.4 + 0.6 * mask
+        images_batch = torch.from_numpy(images_batch)
 
     # Merge images with anomaly maps with given alpha
     overlaid_images = alpha * images_batch + (1 - alpha) * anomaly_maps_rgb
