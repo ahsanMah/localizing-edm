@@ -1,5 +1,5 @@
 import json
-import math
+import copy
 import os
 import pickle
 from functools import partial
@@ -488,13 +488,13 @@ def train_flow(
     return losses
 
 
-def patchflow_stochastic_step(flownet, x, opt, n_samples=128):
-    n_samples = min(n_samples, flownet.flow.num_patches)
+def patchflow_stochastic_step(scorenet, flownet, x, opt, n_samples=128):
+    n_samples = min(n_samples, flownet.num_patches)
     with torch.no_grad():
         # scores = flownet.fastscore(x, chunks=10)
-        scores = flownet.scorenet(x)
+        scores = scorenet(x)
 
-    local_loss = flownet.flow.stochastic_train_step(
+    local_loss = flownet.stochastic_train_step(
         scores, opt, n_patches=n_samples
     )
     total_loss = local_loss
@@ -554,9 +554,10 @@ def train_msma_flow(
     log_tensorboard=False,
     fastflow=False,
     patch_batch_size=32,
+    ema_halflife_kimg = 50,
+    ema_rampup_ratio = .25
 ):
     losses = []
-    opt = torch.optim.AdamW(flownet.flow.parameters(), lr=lr, weight_decay=1e-5)
     batch_sz = train_ds.batch_size
     total_iters = kimg * 1000 // batch_sz + 1
     progbar = tqdm(range(total_iters))
@@ -571,21 +572,41 @@ def train_msma_flow(
     if log_tensorboard:
         writer = SummaryWriter(log_dir=run_dir)
 
+
     flownet = flownet.to(device)
-    flownet.train()
+    # Main copy to be used for "fast" weight updates
+    teacher_flow_model = copy.deepcopy(flownet.flow)
+    teacher_flow_model = teacher_flow_model.to(device)
+    opt = torch.optim.AdamW(teacher_flow_model.parameters(), lr=lr, weight_decay=1e-5)
+
+    # Model will be updated with EMA weights
+    flownet = flownet.eval().requires_grad_(False)
 
     niter = 0
     imgcount = 0
     train_iter = iter(train_ds)
     val_iter = iter(val_ds)
 
+
+
     for niter in progbar:
+
         x, _ = next(train_iter)
         x = x.to(device).to(torch.float32) / 127.5 - 1
         if augment_pipe:
             x, _ = augment_pipe(x)
 
-        loss_dict = train_step(flownet, x, opt)
+        loss_dict = train_step(flownet.scorenet, teacher_flow_model, x, opt)
+
+        # Update original model with EMA weights
+        imgcount += x.shape[0]
+        ema_halflife_nimg = ema_halflife_kimg * 1000
+        if ema_rampup_ratio is not None:
+            ema_halflife_nimg = min(ema_halflife_nimg, imgcount * ema_rampup_ratio)
+        ema_beta = 0.5 ** (batch_sz / max(ema_halflife_nimg, 1e-8))
+        
+        for p_ema, p_net in zip(flownet.flow.parameters(), teacher_flow_model.parameters()):
+            p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         if log_tensorboard:
             for loss_type in loss_dict:
@@ -610,14 +631,11 @@ def train_msma_flow(
                     # for z, ldj in zip(z, log_jac_det):
                     #     val_loss += nll(z, ldj).item()
 
-            flownet.train()
-
             progbar.set_description(f"Val Loss: {val_loss:.4f}")
             if log_tensorboard:
                 writer.add_scalar("val_loss", val_loss, niter)
             losses.append(val_loss)
 
-        imgcount += x.shape[0]
         progbar.set_postfix(batch=f"{imgcount}/{kimg}K")
 
         if niter % checkpoint_interval == 0:
