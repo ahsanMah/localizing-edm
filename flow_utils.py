@@ -11,6 +11,11 @@ import torch
 import torch.nn as nn
 import torchvision.utils as vutils
 
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+from matplotlib import ticker
+import matplotlib as mpl
+import matplotlib.colors as mcolors
+
 class InvGMM(nn.Module):
 
     def __init__(self, n_dims,cond_dim, n_mixture_components=3) -> None:
@@ -385,7 +390,10 @@ def plot_batch_with_heatmaps(
                 vmax=np.quantile(anomap, 0.99),
             )
         else:
-            norm = colors.LogNorm(
+#             norm = colors.LogNorm(
+#                 vmin=np.quantile(anomap, 0.01), vmax=np.quantile(anomap, 0.99)
+#             )
+            norm = colors.Normalize(
                 vmin=np.quantile(anomap, 0.01), vmax=np.quantile(anomap, 0.99)
             )
         shape = anomap.shape
@@ -402,7 +410,7 @@ def plot_batch_with_heatmaps(
     #     scaled_heatmaps  = norm(anomaly_maps.ravel()).reshape(*shape)
 
     # Expand anomaly_maps to 3 color channels and apply colormap
-    anomaly_maps_rgb = plt.get_cmap("jet")(scaled_heatmaps)[:, :, :, :3]
+    anomaly_maps_rgb = plt.get_cmap("coolwarm")(scaled_heatmaps)[:, :, :, :3]
     anomaly_maps_rgb = torch.from_numpy(anomaly_maps_rgb).float()
     anomaly_maps_rgb = anomaly_maps_rgb.permute(0, 3, 1, 2)
 
@@ -574,3 +582,100 @@ def metrics_evaluation(scores, masks, expect_fpr=0.3, max_step=5000):
     #                 f.write("det_pr, det_auc, seg_pr, seg_auc, seg_pro, seg_iou\n")
     #                 f.write(f"{det_pr_score:.5f},{det_auc_score:.5f},{seg_pr_score:.5f},{seg_auc_score:.5f},{pro_auc_score:.5f},{best_miou:.5f}")
     return df_metrics, df_metrics_30fpr
+
+
+
+
+def plot_batch_with_normalized_heatmaps(
+    images_batch,
+    anomaly_maps,
+    quantiles,
+    ground_truth_masks=None,
+    clip_val=None,
+    grid_size=(5, 5),
+    blur_radius=5,
+    alpha=0.5,
+    power_gamma = 1.0
+):
+    """
+
+    Anomaly maps are expected to be anomaly scores i.e. higher is more anomalous
+    Make sure if passing in likelihoods, the maps should be inverted appropriately
+    """
+    
+    qmin = np.min(quantiles)
+    qmax = np.max(quantiles)
+    pnorm = mpl.colors.PowerNorm(power_gamma, vmin=qmin, vmax=qmax, clip=False)
+    
+    mapped_quantiles = (quantiles - qmin) / (qmax - qmin)
+
+    # Build colormap from quantiles
+    quantile_cmap = mcolors.LinearSegmentedColormap.from_list(
+        'custom', 
+        [(mq, color) for mq, color in zip(
+            mapped_quantiles, mpl.cm.coolwarm(np.linspace(0, 1, len(mapped_quantiles)))
+        )],
+        N=256
+    )
+
+    quantile_cmap.set_over(color="Yellow")
+    # quantile_cmap.set_over(color="orangered")
+
+    # anomaly_maps = anomaly_maps.squeeze(1)
+
+    # Putting batch as "channel" dimension
+    # so kernel is run over all batches (independently)
+    anomaly_maps = anomaly_maps.transpose(1, 2, 0)
+    anomaly_maps = cv.blur(anomaly_maps, ksize=(blur_radius, blur_radius))
+    anomaly_maps = anomaly_maps.transpose(2, 0, 1)
+
+    scaled_heatmaps = pnorm(anomaly_maps)
+    
+#     cmap = mpl.cm.RdGy_r
+    cmap = quantile_cmap
+    anomaly_maps_rgb = cmap(scaled_heatmaps)[:, :, :, :3]
+    anomaly_maps_rgb = torch.from_numpy(anomaly_maps_rgb).float()
+    anomaly_maps_rgb = anomaly_maps_rgb.permute(0, 3, 1, 2)
+
+    if ground_truth_masks is not None:
+        # Use opencv to combine the images and anomaly maps
+        mask = np.expand_dims(ground_truth_masks, 1).repeat(3, 1).astype(np.float32)
+        # mask = cv.c
+        images_batch = images_batch.numpy()
+        # images_batch = cv.addWeighted(images_batch, 0.5, mask, 0.5, 0)
+        images_batch = images_batch * 0.4 + 0.6 * mask
+        images_batch = torch.from_numpy(images_batch)
+
+    # Merge images with anomaly maps with given alpha
+    overlaid_images = alpha * images_batch + (1 - alpha) * anomaly_maps_rgb
+
+    # Convert batch of tensors to grid
+    grid = vutils.make_grid(
+        overlaid_images, nrow=grid_size[1], padding=2, normalize=True
+    )
+
+    # Plot grid
+    fig, ax = plt.subplots(figsize=(3 * grid_size[0], 3 * grid_size[1]))
+    divider = make_axes_locatable(ax)
+    cax = divider.append_axes('bottom', size='3%', pad=0.05)
+
+#     fig = plt.figure(figsize=(3 * grid_size[0], 3 * grid_size[1]))
+#     plt.axis("off")
+#     plt.imshow(np.transpose(grid.numpy(), (1, 2, 0)))
+    
+    
+    fig.colorbar(mpl.cm.ScalarMappable(cmap=quantile_cmap, norm=pnorm),
+                 cax=cax, orientation='horizontal', label='Percentiles',extend="max")
+
+    qs = np.linspace(0.01, 0.999, 10)
+    indxs = [0,5,8,9]
+    labels = [0, 50, 90, 99]
+    # labels = qs[indxs]
+    positions = quantiles[indxs]
+    cax.xaxis.set_major_locator(ticker.FixedLocator(positions))
+    cax.xaxis.set_major_formatter(ticker.FixedFormatter(labels))
+    
+    im = ax.imshow(np.transpose(grid.numpy(), (1, 2, 0)))
+    ax.axis("off")
+
+    return anomaly_maps_rgb
