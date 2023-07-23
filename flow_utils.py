@@ -11,56 +11,129 @@ import torch
 import torch.nn as nn
 import torchvision.utils as vutils
 
-class InvGMM(nn.Module):
+import normflows as nf
+from normflows.distributions.base import BaseDistribution
 
-    def __init__(self, n_dims,cond_dim, n_mixture_components=3) -> None:
+
+class ConditionalGaussianMixture(BaseDistribution):
+    """
+    Mixture of Gaussians with diagonal covariance matrix
+    """
+
+    def __init__(self, n_modes, dim, context_encoder):
+        """Constructor
+
+        Args:
+          n_modes: Number of modes of the mixture model
+          dim: Number of dimensions of each Gaussian
+          loc: List of mean values
+          scale: List of diagonals of the covariance matrices
+          weights: List of mode probabilities
+          trainable: Flag, if true parameters will be optimized during training
+        """
         super().__init__()
 
-        self.n_dims = n_dims
-        self.n_mixture_components = n_mixture_components
-        self.n_U_elements =  n_U_elements = int(n_dims * (n_dims + 1) / 2)
-        # w + mu + U
-        self.params_dim = (n_mixture_components , n_mixture_components * n_dims , n_mixture_components * n_U_elements)
-        self.params_net = nn.Sequential([
-            nn.Linear(cond_dim, sum(self.params_dim)),
-            nn.ReLU(),
-            nn.Linear(sum(self.params_dim), sum(self.params_dim)),
-        ])
+        self.n_modes = n_modes
+        self.dim = dim
+        self.context_encoder = context_encoder
+        self.split_sizes = [
+            self.n_modes,
+            self.n_modes * self.dim,
+            self.n_modes * self.dim,
+        ]
 
-        # Invertible GMM
+    def forward(self, num_samples=1, context=None):
+        encoder_output = self.context_encoder(context)
+        w, loc, log_scale = torch.split(encoder_output, self.split_sizes, dim=1)
+        loc = loc.reshape(loc.shape[0], self.n_modes, self.dim)
+        log_scale = log_scale.reshape(loc.shape[0], self.n_modes, self.dim)
 
-        inp = Ff.InputNode(n_dims, name='input')
-        c_w = Ff.ConditionNode(n_mixture_components, name='weights')
-        c_mu = Ff.ConditionNode(n_mixture_components, n_dims, name='means')
-        c_U = Ff.ConditionNode(n_mixture_components, n_U_elements, name='covariances')
-        c_i = Ff.ConditionNode(0, name='indices')
-        gmm = Ff.Node(inp,
-                Fm.GaussianMixtureModel,
-                {},
-                conditions=[c_w, c_mu, c_U, c_i],
-                name='gmm')
-        out = Ff.OutputNode(gmm, name='output')
-        self.gmm = Ff.GraphINN([inp, c_w, c_mu, c_U, c_i, gmm, out], verbose=True)
+        # Get weights
+        weights = torch.softmax(w, 1)
 
-    # Helper function to make sense of parameter network output
-    def get_gmm_params(self, y):
-        # Run the network and rearrange output by GMM component
-        mixture_coefficients = self.params_net(y)
+        # Sample mode indices
+        mode = torch.multinomial(weights[0, :], num_samples, replacement=True)
+        mode_1h = nn.functional.one_hot(mode, self.n_modes)
+        mode_1h = mode_1h[..., None]
 
-        # Extract the individual parameter values
-        w, mu, U_elements = torch.split(mixture_coefficients, self.params_dim, dim=-1)
+        # Get samples
+        eps_ = torch.randn(num_samples, self.dim, dtype=loc.dtype, device=loc.device)
+        scale_sample = torch.sum(torch.exp(log_scale) * mode_1h, 1)
+        loc_sample = torch.sum(loc * mode_1h, 1)
+        z = eps_ * scale_sample + loc_sample
 
-        mu = mu.reshape(-1, self.n_mixture_components, self.n_dims)
-        U_elements = U_elements.reshape(-1, self.n_mixture_components, self.n_U_elements)
+        # Compute log probability
+        eps = (z[:, None, :] - loc) / torch.exp(log_scale)
+        log_p = (
+            -0.5 * self.dim * np.log(2 * np.pi)
+            + torch.log(weights)
+            - 0.5 * torch.sum(torch.pow(eps, 2), 2)
+            - torch.sum(log_scale, 2)
+        )
+        log_p = torch.logsumexp(log_p, 1)
 
-        # Normalize the mixture coefficients
-        w = Fm.GaussianMixtureModel.normalize_weights(w)
+        return z, log_p
 
-        return w, mu, U_elements
+    def log_prob(self, z, context=None):
+        encoder_output = self.context_encoder(context)
+        w, loc, log_scale = torch.split(encoder_output, self.split_sizes, dim=1)
+        loc = loc.reshape(loc.shape[0], self.n_modes, self.dim)
+        log_scale = log_scale.reshape(loc.shape[0], self.n_modes, self.dim)
 
-    def forward(self, x):
-        pass
+        # Get weights
+        weights = torch.softmax(w, 1)
 
+        # Compute log probability
+        eps = (z[:, None, :] - loc) / torch.exp(log_scale)
+        log_p = (
+            -0.5 * self.dim * np.log(2 * np.pi)
+            + torch.log(weights)
+            - 0.5 * torch.sum(torch.pow(eps, 2), 2)
+            - torch.sum(log_scale, 2)
+        )
+        log_p = torch.logsumexp(log_p, 1)
+
+        return log_p
+
+
+def build_flow_head(
+    latent_size,
+    context_size,
+    hidden_units=256,
+    hidden_layers=2,
+    num_blocks=2,
+    num_mixtures=5,
+):
+    K, D = num_mixtures, latent_size
+
+    gmm_dims = K + (K * D) + (K * D)  # Diagonal Gaussians: weights, mu, scales
+    gmm_context_encoder = torch.nn.Sequential(
+        torch.nn.Linear(context_size, context_size * 2, bias=False),
+        torch.nn.GELU(),
+        torch.nn.Linear(context_size * 2, context_size * 2, bias=False),
+        torch.nn.GELU(),
+        torch.nn.Linear(context_size * 2, gmm_dims, bias=False),
+    )
+
+    flow_blocks = []
+
+    for _ in range(num_blocks):
+        flow_blocks += [
+            nf.flows.AutoregressiveRationalQuadraticSpline(
+                latent_size,
+                hidden_layers,
+                hidden_units,
+                num_context_channels=context_size,
+                activation=nn.GELU,
+            )
+        ]
+        flow_blocks += [nf.flows.LULinearPermute(latent_size)]
+
+    base = ConditionalGaussianMixture(K, D, gmm_context_encoder)
+
+    flow = nf.ConditionalNormalizingFlow(base, flow_blocks)
+
+    return flow
 
 
 class ScoreAttentionBlock(nn.Module):
@@ -77,10 +150,13 @@ class ScoreAttentionBlock(nn.Module):
         pos = pos.reshape(1, embed_dim, h * w).permute(0, 2, 1)  # (B) N x C_d
         self.register_buffer("positional_encoding", pos)
 
-        self.ffn = nn.Sequential(nn.Linear(embed_dim, outdim, bias=False),nn.ReLU(),
-                                 nn.Dropout(dropout),nn.Linear(outdim, outdim, bias=False))
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, outdim, bias=False),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(outdim, outdim, bias=False),
+        )
         self.normout = nn.LayerNorm(outdim)
-        
 
     def forward(self, x, attn_mask=None):
         # Making batch first to trigger flash attention
