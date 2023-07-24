@@ -5,8 +5,8 @@ import pickle
 from functools import partial
 
 import click
-import FrEIA.framework as Ff
-import FrEIA.modules as Fm
+# import FrEIA.framework as Ff
+# import FrEIA.modules as Fm
 import numpy as np
 import pandas as pd
 import torch
@@ -174,14 +174,13 @@ class PatchFlow(torch.nn.Module):
 
             for patch_feature, context_vector in zip(local_patches, context):
                 # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
-                z, ldj = self.flow.log_prob(
+                z = self.flow.log_prob(
                     patch_feature,
                     context=context_vector,
                     # torch.cat([patch_feature, glb_ctx], dim=-1),
                     # c=[spatial_cond],
                 )
                 zs.append(z)
-                log_jac_dets.append(ldj)
 
         if return_attn:
             return zs, log_jac_dets, attn_maps
@@ -287,23 +286,11 @@ class PatchFlow(torch.nn.Module):
     @torch.no_grad()
     def log_density(self, x, fast=True):
         self.eval()
-        zs, jacs = self.forward(x, fast=fast)
-
-        if isinstance(zs, list):
-            zs = torch.stack(zs)
-            jacs = torch.stack(jacs)
-        assert zs.dim() == 3
-
-        logpx = logprob(zs, jacs)
-
-        # x is num_patches x batch
-        # logpx = torch.stack(logpzs)
+        logpx, _ = self.forward(x, fast=fast)
+        
         # Swap batch and patch dim
         logpx = logpx.permute(1, 0)
         logpx = logpx.reshape(x.shape[0], *self.spatial_res)
-
-        # if self.use_global_context:
-        #     logpx = logpx + hres_logpx  # / self.num_patches
 
         return logpx
 
@@ -346,7 +333,7 @@ class ScoreFlow(torch.nn.Module):
             else:
                 x_scores = self.scorenet(x, **score_kwargs)
 
-        return self.flow(x_scores.contiguous())
+        return self.flow(x_scores.contiguous(), fast=vectorize)
 
     @torch.inference_mode()
     def log_density(self, x) -> torch.Tensor:
@@ -506,7 +493,7 @@ def train_msma_flow(
     fastflow=False,
     patch_batch_size=32,
     ema_halflife_kimg=50,
-    ema_rampup_ratio=0.25,
+    ema_rampup_ratio=0.025,
 ):
     losses = []
     batch_sz = train_ds.batch_size
@@ -536,6 +523,7 @@ def train_msma_flow(
     imgcount = 0
     train_iter = iter(train_ds)
     val_iter = iter(val_ds)
+    best_val_loss = np.inf
 
     for niter in progbar:
         x, _ = next(train_iter)
@@ -585,10 +573,11 @@ def train_msma_flow(
 
         progbar.set_postfix(batch=f"{imgcount}/{kimg}K")
 
-        if niter % checkpoint_interval == 0:
+        if niter % checkpoint_interval == 0 and val_loss < best_val_loss:
+             # if the current validation loss is the best one
+            best_val_loss = val_loss # Update the best validation loss
             torch.save(
                 {
-                    "epoch": -1,
                     "kimg": niter,
                     "model_state_dict": flownet.state_dict(),
                     "optimizer_state_dict": opt.state_dict(),
@@ -598,17 +587,19 @@ def train_msma_flow(
             )
 
         # progbar.set_description(f"Loss: {loss:.4f}")
+    if val_loss < best_val_loss:
+        torch.save(
+            {
+                "kimg": niter,
+                "model_state_dict": flownet.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "val_loss": val_loss,
+            },
+            checkpoint_path,
+        )
+    else: # Rename checkpoint_meta to checkpoint
+        os.rename(checkpoint_meta_path, checkpoint_path)
 
-    torch.save(
-        {
-            "epoch": -1,
-            "kimg": niter,
-            "model_state_dict": flownet.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "val_loss": val_loss,
-        },
-        checkpoint_path,
-    )
     if log_tensorboard:
         writer.close()
 
@@ -694,6 +685,7 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
     default=False,
     help="Use U-Net-like architecture (for the lower levels only).",
 )
+@click.option("--gmm_components", default=3, type=int, help="Number of components for gmm.")
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
 @click.option("--kimg", default=10, help="Number of images to train for in 1000s.")
@@ -723,7 +715,9 @@ def main(network_pkl, **kwargs):
     c = dnnlib.EasyDict(**model_config)
     device = torch.device(config.device)
 
-    hparams = f"nb{config.num_blocks}-lr{config.lr}-bs{config.batch_size}-pbs{config.patch_batch_size}-kimg{config.kimg}-augp{config.augment}"
+    hparams = f"nb{config.num_blocks}-lr{config.lr}-bs{config.batch_size}"
+    hparams += f"-pbs{config.patch_batch_size}-kimg{config.kimg}-augp{config.augment}"
+    hparams += f"-gmm{config.gmm_components}"
     config["run_dir"] = f"{config.run_dir}/{hparams}"
 
     if config.resolution is not None:
@@ -781,6 +775,7 @@ def main(network_pkl, **kwargs):
             patch_batch_size=config["patch_batch_size"],
             # patch_batch_size=17*17,
             embed_dim=config["embed_dim"],
+            gmm_components=config["gmm_components"],
         )
 
     # exit()
