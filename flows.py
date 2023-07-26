@@ -24,6 +24,7 @@ from flow_utils import (
     subnet_fc,
     SpatialNorm2D,
     ScoreAttentionBlock,
+    ConditionalGaussianMixture,
 )
 from scorer import EDMScorer, VEScorer
 from torch_utils import misc
@@ -32,7 +33,7 @@ import pdb
 _GCONST_ = -0.9189385332046727  # ln(sqrt(2*pi))
 
 
-def logprob(z, ldj):
+def gaussian_logprob(z, ldj):
     return _GCONST_ - 0.5 * torch.sum(z**2, dim=-1) + ldj
 
 
@@ -60,7 +61,7 @@ class PatchFlow(torch.nn.Module):
                 "padding": 2,
                 "stride": 4,
             },  # factor 4 downsampling
-            "global": {"kernel_size": 5, "padding": 2, "stride": 2},  # factor 2
+            "global": {"kernel_size": 17, "padding": 4, "stride": 4},  # factor 2
         },
         # # factor 4 downsampling
         # "local": {"kernel_size": 7, "padding": 3, "stride": 2},
@@ -69,13 +70,14 @@ class PatchFlow(torch.nn.Module):
         15: {
             "local": {"kernel_size": 15, "padding": 2, "stride": 7},
         },  # factor 8 downsampling
+        17: {"local": {"kernel_size": 17, "padding": 4, "stride": 4}},
     }
 
     def __init__(
         self,
         input_size,
         patch_size=3,
-        spatial_cond_dim=128,
+        context_embedding_size=128,
         num_blocks=2,
         global_flow=False,
         patch_batch_size=128,
@@ -94,10 +96,6 @@ class PatchFlow(torch.nn.Module):
         self.use_global_context = global_flow
 
         with torch.no_grad():
-            # Pooling for global "high resolution" flow
-            # self.global_pooler = SpatialNorm2D(
-            #     channels,  # **PatchFlow.patch_config[3]["global"]
-            # ).requires_grad_(False)
 
             # Pooling for local "patch" flow
             # Each patch-norm is input to the shared conditional flow model
@@ -110,8 +108,8 @@ class PatchFlow(torch.nn.Module):
             self.spatial_res = (h, w)
             self.num_patches = h * w
             low_res_channels = self.channels = c
-            pos = positionalencoding2d(spatial_cond_dim, h, w)
-            pos = pos.reshape(spatial_cond_dim, self.num_patches)
+            pos = positionalencoding2d(context_embedding_size, h, w)
+            pos = pos.reshape(context_embedding_size, self.num_patches)
             pos = pos.permute(1, 0)  # N x C_d
             self.register_buffer("positional_encoding", pos)
             print(
@@ -120,39 +118,27 @@ class PatchFlow(torch.nn.Module):
             print(f"Pooled spatial resolution: {self.spatial_res}")
             print(f"Number of flows / patches: {self.num_patches}")
 
-        # _b, c, h, w = self.global_pooler(torch.empty(1, *input_size)).shape
-        # self.global_flow = nn.Sequential(
-        #     global_pooler,
-        #     build_conv_model((c, h, w), levels=2, num_blocks=num_blocks // 2, unet=False),
-        # )
-
-        # # Output of high res flow is downsampled to match the spatial resolution of the patches
-        # # Downsampling redistributes the spatial dims across the channels
-        # # 2x downsampling -> 4x channels
-        # global_cond_dim = channels * 4
-
-        cond_dims = spatial_cond_dim
+        context_dims = context_embedding_size
 
         if self.use_global_context:
-            # self.global_flow = build_conv_model(
-            #     input_size, levels=2, num_blocks=[num_blocks//2, num_blocks], unet=False
-            # )
-            # self.global_flow = torch.nn.Sequential(
-            #     nn.AdaptiveAvgPool2d((h*2, w*2)),
-            #     self.global_flow,
-            # )
-            # global_cond_dim = channels
-            # self.global_pooler = nn.AdaptiveAvgPool2d((h//2, w//2))
+            # Pooling for global "low resolution" flow
+            self.global_pooler = SpatialNorm2D(
+                channels, **PatchFlow.patch_config[patch_size]["global"]
+            ).requires_grad_(False)
+            # Spatial resolution of the global context patches
+            _, c, h, w = self.global_pooler(torch.empty(1, *input_size)).shape
             self.global_attention = ScoreAttentionBlock(
-                input_size=(c, h, w), embed_dim=embed_dim, outdim=spatial_cond_dim
+                input_size=(c, h, w), embed_dim=embed_dim, outdim=context_embedding_size
             )
-            cond_dims += cond_dims
+            context_dims += context_embedding_size
 
         num_features = low_res_channels  # + global_cond_dim
-        self.flow = self.build_cflow_head(cond_dims, num_features, num_blocks)
+        self.flow = self.build_cflow_head(context_dims, num_features, num_blocks)
 
-        # if gmm_components > 0:
-        #     self.gmm = InvGMM(num_features, num_components=5)
+        if gmm_components > 0:
+            self.gmm = ConditionalGaussianMixture(
+                gmm_components, num_features, context_dims
+            )
 
     def init_weights(self):
         # Initialize weights with Xavier
@@ -171,7 +157,7 @@ class PatchFlow(torch.nn.Module):
                     if m.bias is not None:
                         nn.init.zeros_(m.bias.data)
 
-    def build_cflow_head(self, n_cond, n_feat, num_blocks=2, gmm=False):
+    def build_cflow_head(self, n_cond, n_feat, num_blocks=2):
         coder = Ff.SequenceINN(n_feat)
         for k in range(num_blocks):
             # idx = int(k % 2 == 0)
@@ -179,7 +165,7 @@ class PatchFlow(torch.nn.Module):
                 Fm.AllInOneBlock,
                 cond=0,
                 cond_shape=(n_cond,),
-                subnet_constructor=subnet_fc,
+                subnet_constructor=partial(subnet_fc, act=nn.GELU),
                 global_affine_type="SOFTPLUS",
                 permute_soft=True,
                 affine_clamping=1.9,
@@ -195,18 +181,18 @@ class PatchFlow(torch.nn.Module):
         return x
 
     def forward(self, x, return_attn=False, fast=True):
-        B = x.shape[0]
-        x = self.local_pooler(x)
-        local_patches = self.patchify(x)  # Patches x batch x channels
+        B, C = x.shape[0], x.shape[1]
+        h = self.local_pooler(x)
+
+        local_patches = self.patchify(h)  # Patches x batch x channels
         context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
 
         if self.use_global_context:
-            mask = torch.eye(
-                self.num_patches, dtype=torch.bool, device=x.device, requires_grad=False
-            )
-
-            global_context, attn_maps = self.global_attention(local_patches, mask)
-            context = torch.cat([context, global_context], dim=-1)
+            global_patches = self.global_pooler(x)
+            # pdb.set_trace()
+            global_patches = global_patches.reshape(B, C, -1).permute(0, 2, 1)
+            global_context = self.global_attention(global_patches)
+            
 
         if fast:
             zs, log_jac_dets = self.fast_forward(local_patches, context)
@@ -217,14 +203,23 @@ class PatchFlow(torch.nn.Module):
 
             for patch_feature, context_vector in zip(local_patches, context):
                 # print(patch_feature.shape, glb_ctx.shape, spatial_cond.shape)
+                context_vector = torch.cat([context_vector, global_context], dim=-1)
                 z, ldj = self.flow(
                     patch_feature,
                     c=[context_vector],
                     # torch.cat([patch_feature, glb_ctx], dim=-1),
                     # c=[spatial_cond],
                 )
+                if self.gmm is not None:
+                    z = self.gmm(z, context_vector)
                 zs.append(z)
                 log_jac_dets.append(ldj)
+
+        if self.gmm is not None:
+            zs = torch.cat(zs, dim=0).reshape(self.num_patches, B)
+        else:
+            zs = torch.cat(zs, dim=0).reshape(self.num_patches, B, C)
+        log_jac_dets = torch.cat(log_jac_dets, dim=0).reshape(self.num_patches, B)
 
         if return_attn:
             return zs, log_jac_dets, attn_maps
@@ -240,13 +235,8 @@ class PatchFlow(torch.nn.Module):
         _, _, D = ctx.shape
         x, ctx = x.reshape(P * B, C), ctx.reshape(P * B, D)
         x, ctx = x.chunk(nchunks, dim=0), ctx.chunk(nchunks, dim=0)
-        (
-            zs,
-            jacs,
-        ) = (
-            [],
-            [],
-        )
+        zs = []
+        jacs = []
 
         for p, c in zip(x, ctx):
             # assert torch.isclose(c[0, :32], c[B-1, :32]).all() # Check that patch context is same for all batch elements
@@ -255,25 +245,32 @@ class PatchFlow(torch.nn.Module):
                 p,
                 c=[c],
             )
+            if self.gmm is not None:
+                z = self.gmm(z, c)
             zs.append(z)
             jacs.append(ldj)
 
-        zs = torch.cat(zs, dim=0).reshape(self.num_patches, B, C)
-        jacs = torch.cat(jacs, dim=0).reshape(self.num_patches, B)
+        # # pdb.set_trace()
+        # if self.gmm is not None:
+        #     C = 1
+        # zs = torch.cat(zs, dim=0).reshape(self.num_patches, B, C)
+        # jacs = torch.cat(jacs, dim=0).reshape(self.num_patches, B)
 
         return zs, jacs
 
+    def logprob(self, zs, log_jac_dets):
+        if self.gmm is not None:
+            return zs + log_jac_dets
+        return gaussian_logprob(zs, log_jac_dets)
+
+    def nll(self, zs, log_jac_dets):
+        return -torch.mean(self.logprob(zs, log_jac_dets))
+
     def stochastic_train_step(self, x, opt, n_patches=1):
-        B = x.shape[0]
-        x = self.local_pooler(x)
-        local_patches = self.patchify(x)  # Patches x batch x channels
+        B, C, _, _ = x.shape
+        h = self.local_pooler(x)
+        local_patches = self.patchify(h)  # Patches x batch x channels
         context = self.positional_encoding.unsqueeze(1).repeat(1, B, 1)
-        
-        if self.use_global_context:
-            G = self.global_attention
-            mask = torch.eye(
-                self.num_patches, dtype=torch.bool, device=x.device, requires_grad=False
-            )
 
         rand_idx = torch.randperm(self.num_patches)[:n_patches]
         local_loss = 0.0
@@ -285,25 +282,20 @@ class PatchFlow(torch.nn.Module):
 
             if self.use_global_context:
                 # Need separate loss for each patch
-                glb_ctx = G.proj(local_patches.permute(1, 0, 2))
-                glb_ctx = G.norm(glb_ctx.add_(G.positional_encoding))
-                # print("GLOBAL CTX:",glb_ctx.shape)
-                p = glb_ctx[:, [idx], :]
-                p_ctx, attn_maps = G.attention(
-                    p, glb_ctx, glb_ctx, attn_mask=mask[idx].unsqueeze(0)
+                global_patches = (
+                    self.global_pooler(x).reshape(B, C, -1).permute(0, 2, 1)
                 )
-                p_ctx = G.normout(G.ffn(p + p_ctx))
-                p_ctx = p_ctx.squeeze(1)
-                # print(p_ctx.shape, attn_maps.shape)
-                context_vector = torch.cat([context_vector, p_ctx], dim=-1)
+                global_context = self.global_attention(global_patches)
+                context_vector = torch.cat([context_vector, global_context], dim=-1)
 
             z, ldj = self.flow(
                 patch_feature,
                 c=[context_vector],
             )
-
+            if self.gmm is not None:
+                z = self.gmm(z, context_vector)
             opt.zero_grad(set_to_none=True)
-            loss = nll(z, ldj)
+            loss = self.nll(z, ldj)
             loss.backward()
 
             opt.step()
@@ -340,9 +332,9 @@ class PatchFlow(torch.nn.Module):
         if isinstance(zs, list):
             zs = torch.stack(zs)
             jacs = torch.stack(jacs)
-        assert zs.dim() == 3
+        # assert zs.dim() == 3
 
-        logpx = logprob(zs, jacs)
+        logpx = self.logprob(zs, jacs)
 
         # x is num_patches x batch
         # logpx = torch.stack(logpzs)
@@ -394,7 +386,7 @@ class ScoreFlow(torch.nn.Module):
             else:
                 x_scores = self.scorenet(x, **score_kwargs)
 
-        return self.flow(x_scores.contiguous())
+        return self.flow(x_scores.contiguous(), fast=vectorize)
 
     @torch.inference_mode()
     def log_density(self, x) -> torch.Tensor:
@@ -426,6 +418,7 @@ def load_pretrained_model(network_pkl):
     net = model["ema"]
     return net, config
 
+
 @torch.inference_mode()
 def per_dim_ll(inn, x):
     inn.eval()
@@ -448,7 +441,7 @@ def logloss(z, log_jac_det):
 
 def nll(z, ldj):
     # logpz = -0.5 * torch.sum(z**2, dim=1) + ldj
-    return -torch.mean(logprob(z, ldj))
+    return -torch.mean(gaussian_logprob(z, ldj))
 
 
 def build_nd_flow(input_dim, num_blocks=4, ndim=128):
@@ -494,9 +487,7 @@ def patchflow_stochastic_step(scorenet, flownet, x, opt, n_samples=128):
         # scores = flownet.fastscore(x, chunks=10)
         scores = scorenet(x)
 
-    local_loss = flownet.stochastic_train_step(
-        scores, opt, n_patches=n_samples
-    )
+    local_loss = flownet.stochastic_train_step(scores, opt, n_patches=n_samples)
     total_loss = local_loss
     local_loss = local_loss / n_samples
 
@@ -554,8 +545,8 @@ def train_msma_flow(
     log_tensorboard=False,
     fastflow=False,
     patch_batch_size=32,
-    ema_halflife_kimg = 50,
-    ema_rampup_ratio = .25
+    ema_halflife_kimg=50,
+    ema_rampup_ratio=0.0125,
 ):
     losses = []
     batch_sz = train_ds.batch_size
@@ -572,7 +563,6 @@ def train_msma_flow(
     if log_tensorboard:
         writer = SummaryWriter(log_dir=run_dir)
 
-
     flownet = flownet.to(device)
     # Main copy to be used for "fast" weight updates
     teacher_flow_model = copy.deepcopy(flownet.flow)
@@ -586,11 +576,9 @@ def train_msma_flow(
     imgcount = 0
     train_iter = iter(train_ds)
     val_iter = iter(val_ds)
-
-
+    best_val_loss = np.inf
 
     for niter in progbar:
-
         x, _ = next(train_iter)
         x = x.to(device).to(torch.float32) / 127.5 - 1
         if augment_pipe:
@@ -604,8 +592,10 @@ def train_msma_flow(
         if ema_rampup_ratio is not None:
             ema_halflife_nimg = min(ema_halflife_nimg, imgcount * ema_rampup_ratio)
         ema_beta = 0.5 ** (batch_sz / max(ema_halflife_nimg, 1e-8))
-        
-        for p_ema, p_net in zip(flownet.flow.parameters(), teacher_flow_model.parameters()):
+
+        for p_ema, p_net in zip(
+            flownet.flow.parameters(), teacher_flow_model.parameters()
+        ):
             p_ema.copy_(p_net.detach().lerp(p_ema, ema_beta))
 
         if log_tensorboard:
@@ -622,12 +612,15 @@ def train_msma_flow(
                 x, _ = next(val_iter)
                 x = x.to(device).to(torch.float32) / 127.5 - 1
                 z, log_jac_det = flownet(x, vectorize=True)
+                # print(z.shape, log_jac_det.shape)
                 if fastflow:
                     val_loss += logloss(z, log_jac_det).item()
                 else:
                     # print(z.shape, log_jac_det.shape)
                     # pdb.set_trace()
-                    val_loss = -logprob(z, log_jac_det).mean(-1).sum().item()
+                    # val_loss = -flownet.flow.logprob(z, log_jac_det).mean(-1).sum().item()
+                    val_loss = flownet.flow.nll(z, log_jac_det).item()
+
                     # for z, ldj in zip(z, log_jac_det):
                     #     val_loss += nll(z, ldj).item()
 
@@ -638,10 +631,11 @@ def train_msma_flow(
 
         progbar.set_postfix(batch=f"{imgcount}/{kimg}K")
 
-        if niter % checkpoint_interval == 0:
+        if niter % checkpoint_interval == 0 and val_loss < best_val_loss:
+            # if the current validation loss is the best one
+            best_val_loss = val_loss  # Update the best validation loss
             torch.save(
                 {
-                    "epoch": -1,
                     "kimg": niter,
                     "model_state_dict": flownet.state_dict(),
                     "optimizer_state_dict": opt.state_dict(),
@@ -651,17 +645,20 @@ def train_msma_flow(
             )
 
         # progbar.set_description(f"Loss: {loss:.4f}")
+    if val_loss < best_val_loss:
+        torch.save(
+            {
+                "epoch": -1,
+                "kimg": niter,
+                "model_state_dict": flownet.state_dict(),
+                "optimizer_state_dict": opt.state_dict(),
+                "val_loss": val_loss,
+            },
+            checkpoint_path,
+        )
+    else:  # Rename checkpoint_meta to checkpoint
+        os.rename(checkpoint_meta_path, checkpoint_path)
 
-    torch.save(
-        {
-            "epoch": -1,
-            "kimg": niter,
-            "model_state_dict": flownet.state_dict(),
-            "optimizer_state_dict": opt.state_dict(),
-            "val_loss": val_loss,
-        },
-        checkpoint_path,
-    )
     if log_tensorboard:
         writer.close()
 
@@ -747,6 +744,11 @@ def build_dataset(dataset_kwargs, augment_prob=0.1, val_ratio=0.1):
     default=False,
     help="Use U-Net-like architecture (for the lower levels only).",
 )
+@click.option(
+    "--gmm_components", default=3, type=int, help="Number of components for gmm."
+)
+
+
 # Optimization options
 @click.option("--num_epochs", default=10, help="Number of epochs to train.")
 @click.option("--kimg", default=10, help="Number of images to train for in 1000s.")
@@ -777,6 +779,7 @@ def main(network_pkl, **kwargs):
     device = torch.device(config.device)
 
     hparams = f"nb{config.num_blocks}-lr{config.lr}-bs{config.batch_size}-pbs{config.patch_batch_size}-kimg{config.kimg}-augp{config.augment}"
+    hparams += f"-gmm{config.gmm_components}"
     config["run_dir"] = f"{config.run_dir}/{hparams}"
 
     if config.resolution is not None:
@@ -834,6 +837,7 @@ def main(network_pkl, **kwargs):
             patch_batch_size=config["patch_batch_size"],
             # patch_batch_size=17*17,
             embed_dim=config["embed_dim"],
+            gmm_components=config["gmm_components"],
         )
 
     # exit()

@@ -16,35 +16,43 @@ from matplotlib import ticker
 import matplotlib as mpl
 import matplotlib.colors as mcolors
 
-class InvGMM(nn.Module):
 
-    def __init__(self, n_dims,cond_dim, n_mixture_components=3) -> None:
+class InvGMM(nn.Module):
+    def __init__(self, n_dims, cond_dim, n_mixture_components=3) -> None:
         super().__init__()
 
         self.n_dims = n_dims
         self.n_mixture_components = n_mixture_components
-        self.n_U_elements =  n_U_elements = int(n_dims * (n_dims + 1) / 2)
+        self.n_U_elements = n_U_elements = int(n_dims * (n_dims + 1) / 2)
         # w + mu + U
-        self.params_dim = (n_mixture_components , n_mixture_components * n_dims , n_mixture_components * n_U_elements)
-        self.params_net = nn.Sequential([
-            nn.Linear(cond_dim, sum(self.params_dim)),
-            nn.ReLU(),
-            nn.Linear(sum(self.params_dim), sum(self.params_dim)),
-        ])
+        self.params_dim = (
+            n_mixture_components,
+            n_mixture_components * n_dims,
+            n_mixture_components * n_U_elements,
+        )
+        self.params_net = nn.Sequential(
+            [
+                nn.Linear(cond_dim, sum(self.params_dim)),
+                nn.ReLU(),
+                nn.Linear(sum(self.params_dim), sum(self.params_dim)),
+            ]
+        )
 
         # Invertible GMM
 
-        inp = Ff.InputNode(n_dims, name='input')
-        c_w = Ff.ConditionNode(n_mixture_components, name='weights')
-        c_mu = Ff.ConditionNode(n_mixture_components, n_dims, name='means')
-        c_U = Ff.ConditionNode(n_mixture_components, n_U_elements, name='covariances')
-        c_i = Ff.ConditionNode(0, name='indices')
-        gmm = Ff.Node(inp,
-                Fm.GaussianMixtureModel,
-                {},
-                conditions=[c_w, c_mu, c_U, c_i],
-                name='gmm')
-        out = Ff.OutputNode(gmm, name='output')
+        inp = Ff.InputNode(n_dims, name="input")
+        c_w = Ff.ConditionNode(n_mixture_components, name="weights")
+        c_mu = Ff.ConditionNode(n_mixture_components, n_dims, name="means")
+        c_U = Ff.ConditionNode(n_mixture_components, n_U_elements, name="covariances")
+        c_i = Ff.ConditionNode(0, name="indices")
+        gmm = Ff.Node(
+            inp,
+            Fm.GaussianMixtureModel,
+            {},
+            conditions=[c_w, c_mu, c_U, c_i],
+            name="gmm",
+        )
+        out = Ff.OutputNode(gmm, name="output")
         self.gmm = Ff.GraphINN([inp, c_w, c_mu, c_U, c_i, gmm, out], verbose=True)
 
     # Helper function to make sense of parameter network output
@@ -56,7 +64,9 @@ class InvGMM(nn.Module):
         w, mu, U_elements = torch.split(mixture_coefficients, self.params_dim, dim=-1)
 
         mu = mu.reshape(-1, self.n_mixture_components, self.n_dims)
-        U_elements = U_elements.reshape(-1, self.n_mixture_components, self.n_U_elements)
+        U_elements = U_elements.reshape(
+            -1, self.n_mixture_components, self.n_U_elements
+        )
 
         # Normalize the mixture coefficients
         w = Fm.GaussianMixtureModel.normalize_weights(w)
@@ -67,9 +77,98 @@ class InvGMM(nn.Module):
         pass
 
 
+class ConditionalGaussianMixture(nn.Module):
+    """
+    Mixture of Gaussians with diagonal covariance matrix
+    """
+
+    def __init__(self, n_modes, n_features, context_size):
+        """Constructor
+
+        Args:
+          n_modes: Number of modes of the mixture model
+          dim: Number of dimensions of each Gaussian
+          loc: List of mean values
+          scale: List of diagonals of the covariance matrices
+          weights: List of mode probabilities
+          trainable: Flag, if true parameters will be optimized during training
+        """
+        super().__init__()
+
+        self.n_modes = n_modes
+        self.dim = n_features
+        self.split_sizes = [
+            self.n_modes,
+            self.n_modes * self.dim,
+            self.n_modes * self.dim,
+        ]
+        self.context_encoder = subnet_fc(
+            context_size,
+            sum(self.split_sizes),
+            ndim=context_size * 2,
+            act=nn.GELU,
+            input_norm=False,
+        )
+
+    def sample(self, num_samples=1, context=None):
+        encoder_output = self.context_encoder(context)
+        w, loc, log_scale = torch.split(encoder_output, self.split_sizes, dim=1)
+        loc = loc.reshape(loc.shape[0], self.n_modes, self.dim)
+        log_scale = log_scale.reshape(loc.shape[0], self.n_modes, self.dim)
+
+        # Get weights
+        weights = torch.softmax(w, 1)
+
+        # Sample mode indices
+        mode = torch.multinomial(weights[0, :], num_samples, replacement=True)
+        mode_1h = nn.functional.one_hot(mode, self.n_modes)
+        mode_1h = mode_1h[..., None]
+
+        # Get samples
+        eps_ = torch.randn(num_samples, self.dim, dtype=loc.dtype, device=loc.device)
+        scale_sample = torch.sum(torch.exp(log_scale) * mode_1h, 1)
+        loc_sample = torch.sum(loc * mode_1h, 1)
+        z = eps_ * scale_sample + loc_sample
+
+        # Compute log probability
+        eps = (z[:, None, :] - loc) / torch.exp(log_scale)
+        log_p = (
+            -0.5 * self.dim * np.log(2 * np.pi)
+            + torch.log(weights)
+            - 0.5 * torch.sum(torch.pow(eps, 2), 2)
+            - torch.sum(log_scale, 2)
+        )
+        log_p = torch.logsumexp(log_p, 1)
+
+        return z, log_p
+
+    def forward(self, z, context):
+        return self.logprob(z, context)
+
+    def logprob(self, z, context=None):
+        encoder_output = self.context_encoder(context)
+        w, loc, log_scale = torch.split(encoder_output, self.split_sizes, dim=1)
+        loc = loc.reshape(loc.shape[0], self.n_modes, self.dim)
+        log_scale = log_scale.reshape(loc.shape[0], self.n_modes, self.dim)
+
+        # Get weights
+        weights = torch.softmax(w, 1)
+
+        # Compute log probability
+        eps = (z[:, None, :] - loc) / torch.exp(log_scale)
+        log_p = (
+            -0.5 * self.dim * np.log(2 * np.pi)
+            + torch.log(weights)
+            - 0.5 * torch.sum(torch.pow(eps, 2), 2)
+            - torch.sum(log_scale, 2)
+        )
+        log_p = torch.logsumexp(log_p, 1)
+
+        return log_p
+
 
 class ScoreAttentionBlock(nn.Module):
-    def __init__(self, input_size, embed_dim, outdim=None, num_heads=4, dropout=0.1):
+    def __init__(self, input_size, embed_dim, outdim=None, num_heads=8, dropout=0.1):
         super().__init__()
         num_sigmas, h, w = input_size
         outdim = outdim or embed_dim
@@ -82,14 +181,17 @@ class ScoreAttentionBlock(nn.Module):
         pos = pos.reshape(1, embed_dim, h * w).permute(0, 2, 1)  # (B) N x C_d
         self.register_buffer("positional_encoding", pos)
 
-        self.ffn = nn.Sequential(nn.Linear(embed_dim, outdim, bias=False),nn.ReLU(),
-                                 nn.Dropout(dropout),nn.Linear(outdim, outdim, bias=False))
+        self.ffn = nn.Sequential(
+            nn.Linear(embed_dim, outdim, bias=False),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(outdim, outdim, bias=False),
+        )
         self.normout = nn.LayerNorm(outdim)
-        
 
     def forward(self, x, attn_mask=None):
         # Making batch first to trigger flash attention
-        x = x.permute(1, 0, 2)
+        # x = x.permute(1, 0, 2)
         assert (
             x.shape[1] == self.positional_encoding.shape[1]
         ), "Can only be called on flattened image"
@@ -98,17 +200,21 @@ class ScoreAttentionBlock(nn.Module):
         # x = x @ self.proj
         x = self.norm(x.add_(self.positional_encoding))
 
-        h, attn = self.attention(
+        h, _ = self.attention(
             x,
             x,
             x,
             attn_mask=attn_mask,
+            need_weights=False,
         )
 
         x = self.normout(self.ffn(x + h))
 
-        x = x.permute(1, 0, 2)
-        return x, attn
+        # Spatial mean
+        x = x.mean(dim=1)
+
+        # x = x.permute(1, 0, 2)
+        return x
 
 
 class SpatialNorm2D(nn.Module):
@@ -176,15 +282,16 @@ def compute_same_pad(kernel_size, stride):
     return [((k - 1) * s + 1) // 2 for k, s in zip(kernel_size, stride)]
 
 
-def subnet_fc(c_in, c_out, ndim=256):
+def subnet_fc(c_in, c_out, ndim=256, act=nn.LeakyReLU, input_norm=True):
     return nn.Sequential(
+        nn.LayerNorm(c_in) if input_norm else nn.Identity(),
         nn.Linear(c_in, ndim),
-        nn.ReLU(),
+        act(),
         nn.Linear(ndim, ndim),
-        nn.ReLU(),
+        act(),
+        nn.LayerNorm(ndim),
         nn.Linear(ndim, c_out),
     )
-
 
 def subnet_attention(c_in, c_out, ndim=256):
     pass
@@ -390,9 +497,9 @@ def plot_batch_with_heatmaps(
                 vmax=np.quantile(anomap, 0.99),
             )
         else:
-#             norm = colors.LogNorm(
-#                 vmin=np.quantile(anomap, 0.01), vmax=np.quantile(anomap, 0.99)
-#             )
+            #             norm = colors.LogNorm(
+            #                 vmin=np.quantile(anomap, 0.01), vmax=np.quantile(anomap, 0.99)
+            #             )
             norm = colors.Normalize(
                 vmin=np.quantile(anomap, 0.01), vmax=np.quantile(anomap, 0.99)
             )
@@ -584,8 +691,6 @@ def metrics_evaluation(scores, masks, expect_fpr=0.3, max_step=5000):
     return df_metrics, df_metrics_30fpr
 
 
-
-
 def plot_batch_with_normalized_heatmaps(
     images_batch,
     anomaly_maps,
@@ -595,27 +700,31 @@ def plot_batch_with_normalized_heatmaps(
     grid_size=(5, 5),
     blur_radius=5,
     alpha=0.5,
-    power_gamma = 1.0
+    power_gamma=1.0,
 ):
     """
 
     Anomaly maps are expected to be anomaly scores i.e. higher is more anomalous
     Make sure if passing in likelihoods, the maps should be inverted appropriately
     """
-    
+
     qmin = np.min(quantiles)
     qmax = np.max(quantiles)
     pnorm = mpl.colors.PowerNorm(power_gamma, vmin=qmin, vmax=qmax, clip=False)
-    
+
     mapped_quantiles = (quantiles - qmin) / (qmax - qmin)
 
     # Build colormap from quantiles
     quantile_cmap = mcolors.LinearSegmentedColormap.from_list(
-        'custom', 
-        [(mq, color) for mq, color in zip(
-            mapped_quantiles, mpl.cm.coolwarm(np.linspace(0, 1, len(mapped_quantiles)))
-        )],
-        N=256
+        "custom",
+        [
+            (mq, color)
+            for mq, color in zip(
+                mapped_quantiles,
+                mpl.cm.coolwarm(np.linspace(0, 1, len(mapped_quantiles))),
+            )
+        ],
+        N=256,
     )
 
     quantile_cmap.set_over(color="Yellow")
@@ -630,8 +739,8 @@ def plot_batch_with_normalized_heatmaps(
     anomaly_maps = anomaly_maps.transpose(2, 0, 1)
 
     scaled_heatmaps = pnorm(anomaly_maps)
-    
-#     cmap = mpl.cm.RdGy_r
+
+    #     cmap = mpl.cm.RdGy_r
     cmap = quantile_cmap
     anomaly_maps_rgb = cmap(scaled_heatmaps)[:, :, :, :3]
     anomaly_maps_rgb = torch.from_numpy(anomaly_maps_rgb).float()
@@ -657,24 +766,28 @@ def plot_batch_with_normalized_heatmaps(
     # Plot grid
     fig, ax = plt.subplots(figsize=(3 * grid_size[0], 3 * grid_size[1]))
     divider = make_axes_locatable(ax)
-    cax = divider.append_axes('bottom', size='3%', pad=0.05)
+    cax = divider.append_axes("bottom", size="3%", pad=0.05)
 
-#     fig = plt.figure(figsize=(3 * grid_size[0], 3 * grid_size[1]))
-#     plt.axis("off")
-#     plt.imshow(np.transpose(grid.numpy(), (1, 2, 0)))
-    
-    
-    fig.colorbar(mpl.cm.ScalarMappable(cmap=quantile_cmap, norm=pnorm),
-                 cax=cax, orientation='horizontal', label='Percentiles',extend="max")
+    #     fig = plt.figure(figsize=(3 * grid_size[0], 3 * grid_size[1]))
+    #     plt.axis("off")
+    #     plt.imshow(np.transpose(grid.numpy(), (1, 2, 0)))
+
+    fig.colorbar(
+        mpl.cm.ScalarMappable(cmap=quantile_cmap, norm=pnorm),
+        cax=cax,
+        orientation="horizontal",
+        label="Percentiles",
+        extend="max",
+    )
 
     qs = np.linspace(0.01, 0.999, 10)
-    indxs = [0,5,8,9]
+    indxs = [0, 5, 8, 9]
     labels = [0, 50, 90, 99]
     # labels = qs[indxs]
     positions = quantiles[indxs]
     cax.xaxis.set_major_locator(ticker.FixedLocator(positions))
     cax.xaxis.set_major_formatter(ticker.FixedFormatter(labels))
-    
+
     im = ax.imshow(np.transpose(grid.numpy(), (1, 2, 0)))
     ax.axis("off")
 
